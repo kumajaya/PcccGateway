@@ -229,6 +229,13 @@ public class Gateway : IDisposable
 
         if (_pending.TryRemove(gwTns, out Pending? pend))
         {
+            // Identity-probe reply: complete the probe instead of routing to a client.
+            if (pend.Context is TaskCompletionSource<byte[]> probeTcs)
+            {
+                probeTcs.TrySetResult(replyPdu);
+                return;
+            }
+
             // Restore the client's original TNS so the reply matches the TNS
             // the client actually sent.
             replyPdu[4] = (byte)(pend.OriginalTns & 0xFF);
@@ -312,6 +319,7 @@ public class Gateway : IDisposable
                     _plcTransport.Open();
                     delay = ReconnectInitialDelayMs;   // reset backoff on success
                     Logger.Info(this, "PLC transport connected");
+                    TryDiscoverIdentity(ct);
                 }
                 catch (Exception ex)
                 {
@@ -344,6 +352,183 @@ public class Gateway : IDisposable
             return true;
         }
         return ct.IsCancellationRequested || !_running;
+    }
+
+    // ─── Dynamic PLC identity discovery ──────────────────────────────
+
+    /// <summary>
+    /// Probes the connected PLC for its identity and advertises it to EIP clients,
+    /// so RSLinx and friends see the real processor (a PLC), not a bridge. Runs on
+    /// every successful (re)connect, so if the PLC behind the gateway is swapped —
+    /// which drops and re-establishes the link — the advertised identity follows the
+    /// new hardware. Failure is non-fatal: the last-known (or fallback) identity is
+    /// kept, so clients keep talking directly.
+    /// </summary>
+    private void TryDiscoverIdentity(CancellationToken ct)
+    {
+        try
+        {
+            byte[]? payload = ProbeDiagnosticStatus(ct);
+            if (payload != null)
+            {
+                Logger.Hex(this, "Diagnostic Status", payload, payload.Length);
+                ApplyDiscoveredIdentity(payload);   // updates identity if the PLC changed
+            }
+            else
+            {
+                Logger.Info(this, "Identity discovery: no PLC response — keeping current identity");
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn(this, $"Identity discovery error: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Sends PCCC Get Diagnostic Status (CMD 0x06, FNC 0x03) to the PLC using the
+    /// gateway's own TNS correlation and returns the reply's DATA payload, or null
+    /// on timeout/error.
+    /// </summary>
+    private byte[]? ProbeDiagnosticStatus(CancellationToken ct, int timeoutMs = 3000)
+    {
+        var tcs = new TaskCompletionSource<byte[]>(TaskCreationOptions.RunContinuationsAsynchronously);
+        ushort gwTns = AllocateGatewayTns(tcs, 0);
+
+        // Inner PCCC frame: DST SRC CMD=0x06 STS=0 TNS_LO TNS_HI FNC=0x03
+        byte[] frame =
+        {
+            0x01, 0x00, 0x06, 0x00,
+            (byte)(gwTns & 0xFF), (byte)((gwTns >> 8) & 0xFF),
+            0x03
+        };
+
+        try
+        {
+            _plcTransport.SendFrame(frame);
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn(this, $"Identity probe send failed: {ex.Message}");
+            _pending.TryRemove(gwTns, out _);
+            return null;
+        }
+
+        try
+        {
+            if (tcs.Task.Wait(timeoutMs, ct))
+            {
+                byte[] reply = tcs.Task.Result;
+                // reply = [DST SRC CMD STS TNS_LO TNS_HI DATA...]; DATA begins at offset 6.
+                // The Get Diagnostic Status reply (CMD 0x46) carries NO FNC byte between
+                // TNS and DATA — verified against a real PLC-5/40E Wireshark capture
+                // (reply data starts "06 EB 4B ..." right after TNS) and a live
+                // MicroLogix 1400 trace (DATA begins "00 EE 4A 9F ..." at offset 6).
+                // STS (offset 3) must be 0 — an error reply's trailing bytes are status/echo
+                // data, not diagnostic data, and must not be parsed as an identity.
+                if (reply.Length > 6 && reply[3] == 0x00)
+                    return reply[6..];
+                if (reply.Length > 3 && reply[3] != 0x00)
+                    Logger.Warn(this, $"Identity probe: PLC returned STS=0x{reply[3]:X2} — ignoring");
+                return null;
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Shutdown in progress: abandon the probe promptly so Stop() does not race
+            // Close()/Clear() against a supervisor thread still blocked here.
+            _pending.TryRemove(gwTns, out _);
+            return null;
+        }
+
+        _pending.TryRemove(gwTns, out _);
+        Logger.Warn(this, "Identity probe timed out");
+        return null;
+    }
+
+    // EDS-derived identity table: PCCC processor type → CIP (Product Type, Product
+    // Code, Revision, Name). Values are taken from Rockwell EDS files — authoritative,
+    // because the PCCC processor-type namespace and the CIP Product-Code namespace are
+    // NOT consistent (e.g. PLC-5/40E is PCCC 0x4B but CIP Product Code 23; SLC-5/05
+    // happens to match, MicroLogix 1400 does not). Product Type also varies (12 vs 14),
+    // so nothing is hardcoded here.
+    private static readonly Dictionary<byte, (ushort type, ushort code, byte revMaj, byte revMin, string name)> EdsIdentity = new()
+    {
+        // PLC-5 Ethernet (1785-Lx0E, series C–E)
+        [0x4A] = (14, 22,  1, 0, "PLC-5/20E"),
+        [0x4B] = (14, 23,  1, 0, "PLC-5/40E"),
+        [0x59] = (14, 24,  1, 0, "PLC-5/80E"),
+        // MicroLogix
+        [0x9F] = (14, 90,  2, 0, "MicroLogix 1400"),
+        [0x90] = (14, 90,  2, 0, "MicroLogix 1400"),
+        [0xB9] = (12, 185, 2, 0, "MicroLogix 1100"),
+        // SLC 5/05 (1747-L55x) — Comms-Adapter product-type variants
+        [0xB0] = (12, 176, 3, 0, "SLC 5/05"),
+        [0xB1] = (12, 177, 3, 0, "SLC 5/05"),
+        [0xB2] = (12, 178, 3, 0, "SLC 5/05"),
+        // SLC 5/05 — PLC product-type variants
+        [0x13] = (14, 19,  3, 0, "SLC 5/05"),
+        [0x14] = (14, 20,  3, 6, "SLC 5/05"),
+        [0x15] = (14, 21,  3, 0, "SLC 5/05"),
+        // Older SLC 500 (5/01–5/04) have NO native EtherNet/IP — EIP arrived with the
+        // 5/05. They are presented with the SLC 5/05 EtherNet/IP identity (Type 14,
+        // Code 20) so RSLinx can reach them over EtherNet/IP through the gateway; the
+        // real processor is still revealed by the client's own PCCC query.
+        [0x88] = (14, 20,  3, 6, "SLC 5/01"),
+        [0x89] = (14, 20,  3, 6, "SLC 5/02"),
+        [0x49] = (14, 20,  3, 6, "SLC 5/03"),
+        [0x5B] = (14, 20,  3, 6, "SLC 5/04"),
+    };
+
+    /// <summary>
+    /// Builds a CIP Identity from a Get Diagnostic Status payload (AB Pub 1770-6.5.16).
+    /// The PCCC processor type is looked up in the EDS-derived table for an accurate
+    /// CIP Product Type / Code / Name that RSLinx recognises via its own EDS database.
+    /// Unknown processors fall back to a generic non-ENI PLC identity (Device Type 14)
+    /// with the name the PLC reports in its catalog string.
+    /// </summary>
+    private bool ApplyDiscoveredIdentity(byte[] payload)
+    {
+        if (payload.Length < 5) return false;
+
+        // Family from the type-extender byte, processor type from a family-specific
+        // offset (AB Pub 1770-6.5.16). Verified against real hardware captures:
+        //   PLC-5/40E : payload = 06 EB 4B ...  → byte[1]=0xEB (nibble 0xB) → expansion byte[2]=0x4B
+        //   ML 1400   : payload = 00 EE 4A 9F ...→ byte[1]=0xEE (nibble 0xE) → proc type byte[3]=0x9F
+        byte typeExtender = payload[1];
+        bool isPlc5 = (typeExtender & 0x0F) == 0x0B;   // 0xEB → PLC-5; 0xEE → SLC/MicroLogix
+
+        byte procType = isPlc5
+            ? payload[2]                                       // PLC-5: expansion byte
+            : (payload.Length > 3 ? payload[3] : (byte)0);     // SLC/ML: extended processor type
+
+        if (EdsIdentity.TryGetValue(procType, out var id))
+        {
+            _eipTransport.SetProductIdentity(id.type, id.code, id.revMaj, id.revMin, id.name);
+            return true;
+        }
+
+        // Unknown processor type: fall back to the family's most representative
+        // EtherNet/IP-capable identity, so RSLinx still recognises it (and picks the
+        // correct read protocol) instead of seeing an unknown product code. The family
+        // is always known from the type-extender byte even when the exact type is not.
+        if (isPlc5)
+        {
+            // Unknown PLC-5 → PLC-5/40E (Type 14, Code 23), the common PLC-5E.
+            _eipTransport.SetProductIdentity(14, 23, 1, 0, "PLC-5");
+        }
+        else
+        {
+            // Unknown SLC/MicroLogix → SLC 5/05 (Type 14, Code 20), the EtherNet/IP SLC.
+            // Keep the catalog string the PLC reported as the display name.
+            int end = Math.Min(16, payload.Length);
+            string catalog = end > 5
+                ? System.Text.Encoding.ASCII.GetString(payload, 5, end - 5).Trim('\0', ' ')
+                : string.Empty;
+            string name = string.IsNullOrWhiteSpace(catalog) ? "SLC 5/05" : catalog;
+            _eipTransport.SetProductIdentity(14, 20, 3, 6, name);
+        }
+        return true;
     }
 
     // ─── IDisposable ─────────────────────────────────────────────────

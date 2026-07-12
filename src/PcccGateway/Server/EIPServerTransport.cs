@@ -182,20 +182,26 @@ public partial class EIPServerTransport : IServerTransport, IDisposable
     //   Minor Rev     = 20    (2.7 firmware)
     //   Product Name  = "1761-NET-ENI"
 
-    private const ushort EIP_VENDOR_ID    = 1;
+    // Locked fields. Device Type 0x000E = Programmable Logic Controller (per the
+    // real PLC-5 EDS), which makes RSLinx talk to us directly as a PLC instead of
+    // trying to route through us as a bridge. Product Code, Revision, and Product
+    // Name are discovered from the connected PLC's Get Diagnostic Status; the
+    // values below are the non-ENI fallback used until discovery succeeds.
+    private const ushort EIP_VENDOR_ID    = 1;         // Rockwell Automation
     private const uint   EIP_SERIAL_NUM   = 0x600DCAFE; // arbitrary unique serial
 
-    private const ushort EIP_DEVICE_TYPE  = 12;   // 0x000C = Communications Adapter
-    private const ushort EIP_PRODUCT_CODE = 99;   // 0x0063 = 1761-NET-ENI
-    private const byte   EIP_REV_MAJOR    = 3;    // Series C/D
-    private const byte   EIP_REV_MINOR    = 20;   // Firmware 2.7
-    private const string EIP_PRODUCT_NAME = "1761-NET-ENI";
+    private const ushort EIP_DEVICE_TYPE  = 0x000E;    // Programmable Logic Controller
+    private const ushort EIP_PRODUCT_CODE = 20;        // SLC 5/05 — blind default before discovery
+    private const byte   EIP_REV_MAJOR    = 3;          // (matches the emulator's proven default)
+    private const byte   EIP_REV_MINOR    = 6;
+    private const string EIP_PRODUCT_NAME = "SLC 5/05";
 
     /// <summary>
     /// Identity Object attributes (bytes 5-8 of the Identity Item in
     /// ListIdentity and GetAttributes responses). Built once at construction.
     /// </summary>
-    internal readonly byte[] _identityData;
+    internal volatile byte[] _identityData;   // volatile: swapped by reference from the
+                                               // supervisor thread, read by request threads
 
     // ── Vendor identification embedded in Execute PCCC Request ID ────────────
     //
@@ -208,7 +214,9 @@ public partial class EIPServerTransport : IServerTransport, IDisposable
     // ── ILinkTransport ────────────────────────────────────────────────────────
 
     /// <summary>Product name string used in log messages.</summary>
-    internal string ProductName => EIP_PRODUCT_NAME;
+    // Current product name, updated on identity discovery (starts at the fallback).
+    private volatile string _productName = EIP_PRODUCT_NAME;
+    internal string ProductName => _productName;
 
     public string Name => "EIP";
 
@@ -225,7 +233,7 @@ public partial class EIPServerTransport : IServerTransport, IDisposable
     public EIPServerTransport(int port = EIP_DEFAULT_PORT)
     {
         _port         = port;
-        _identityData = BuildIdentityData();
+        _identityData = BuildIdentityData(EIP_DEVICE_TYPE, EIP_PRODUCT_CODE, EIP_REV_MAJOR, EIP_REV_MINOR, EIP_PRODUCT_NAME);
     }
 
     public const int EIP_DEFAULT_PORT = 44818;
@@ -685,14 +693,23 @@ public partial class EIPServerTransport : IServerTransport, IDisposable
     /// responses.  Constructed once at static initialisation to avoid
     /// repeated allocations.
     /// </summary>
-    private static byte[] BuildIdentityData()
+    /// <summary>
+    /// Replaces the advertised Identity with values discovered from the connected
+    /// PLC. Only Vendor ID stays fixed; Device Type, Product Code, Revision, and
+    /// Product Name all reflect the real processor (Device Type is 12 or 14
+    /// depending on the model, per its EDS). Thread-safe: the identity byte array
+    /// is swapped by reference (an atomic operation).
+    /// </summary>
+    public void SetProductIdentity(ushort deviceType, ushort productCode, byte revMajor, byte revMinor, string productName)
     {
-        ushort deviceType  = EIP_DEVICE_TYPE;
-        ushort productCode = EIP_PRODUCT_CODE;
-        byte   revMajor    = EIP_REV_MAJOR;
-        byte   revMinor    = EIP_REV_MINOR;
-        string productName = EIP_PRODUCT_NAME;
+        _identityData = BuildIdentityData(deviceType, productCode, revMajor, revMinor, productName);
+        _productName  = productName;
+        Logger.Info(this, $"Identity set from PLC: type={deviceType} code={productCode} rev={revMajor}.{revMinor} name=\"{productName}\"");
+    }
 
+    private static byte[] BuildIdentityData(ushort deviceType, ushort productCode,
+                                            byte revMajor, byte revMinor, string productName)
+    {
         using var ms = new MemoryStream();
         using var w  = new BinaryWriter(ms);
 
