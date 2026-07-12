@@ -26,4 +26,9 @@
     <PackageReference Include="System.IO.Ports" Version="8.0.0" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Expose internal members to the unit-test assembly. -->
+    <InternalsVisibleTo Include="PcccGateway.Tests" />
+  </ItemGroup>
+
 </Project>

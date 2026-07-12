@@ -118,7 +118,7 @@ public abstract class DF1BaseTransport : ITransport
     /// <summary>
     /// Applies DLE stuffing to a payload: every 0x10 byte is duplicated.
     /// </summary>
-    protected static byte[] ApplyDleStuffing(byte[] payload)
+    protected internal static byte[] ApplyDleStuffing(byte[] payload)
     {
         var result = new List<byte>(payload.Length * 2);
         foreach (byte b in payload)
@@ -133,7 +133,7 @@ public abstract class DF1BaseTransport : ITransport
     /// <summary>
     /// Removes DLE stuffing from a stuffed payload.
     /// </summary>
-    protected static byte[] RemoveDleStuffing(byte[] stuffed)
+    protected internal static byte[] RemoveDleStuffing(byte[] stuffed)
     {
         var result = new List<byte>(stuffed.Length);
         for (int i = 0; i < stuffed.Length; i++)
