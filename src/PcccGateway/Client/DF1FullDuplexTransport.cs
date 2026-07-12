@@ -183,18 +183,23 @@ public class DF1FullDuplexTransport : DF1BaseTransport
         if (!IsOpen)
             Open();
 
-        _ackFlagForEnq = false;
-        _nakFlagForEnq = false;
-        _enqEvent.Reset();
+        // Serialise with SendFrame: an ENQ probe (auto-detect) must not interleave
+        // its bytes or share the ACK/NAK signalling state with an in-flight send.
+        lock (_txLock)
+        {
+            _ackFlagForEnq = false;
+            _nakFlagForEnq = false;
+            _enqEvent.Reset();
 
-        SendControl(ENQ);
+            SendControl(ENQ);
 
-        int timeoutMs = MaxTicks * 20;
-        _enqEvent.Wait(timeoutMs);
+            int timeoutMs = MaxTicks * 20;
+            _enqEvent.Wait(timeoutMs);
 
-        if (_ackFlagForEnq) return 0;
-        if (_nakFlagForEnq) return -2;
-        return -3;
+            if (_ackFlagForEnq) return 0;
+            if (_nakFlagForEnq) return -2;
+            return -3;
+        }
     }
 
     /// <summary>

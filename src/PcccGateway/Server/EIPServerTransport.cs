@@ -264,7 +264,7 @@ public partial class EIPServerTransport : IServerTransport, IDisposable
             SetHealthStatsEnabled(!Logger.Enabled);
 
             // Cache local IP address once at startup (avoid repeated enumeration)
-            _cachedLocalAddress = GetLocalUnicastIPv4Address();
+            _cachedLocalAddress = GetLocalUnicastIPv4Address() ?? IPAddress.Loopback;
             if (_cachedLocalAddress == null)
                 Logger.Info(this, "No valid IPv4 unicast address found for ListIdentity");
 
@@ -1078,7 +1078,7 @@ public sealed partial class EIPServerTransport
                 try
                 {
                     // Every EIP packet begins with a fixed 24-byte encapsulation header.
-                    if (await ReadExactAsync(buf, 0, 24).ConfigureAwait(false) < 24)
+                    if (await ReadExactAsync(buf, 0, 24, idleFirstByte: true).ConfigureAwait(false) < 24)
                         break;
 
                     ushort command = (ushort)(buf[0] | (buf[1] << 8));
@@ -1094,7 +1094,7 @@ public sealed partial class EIPServerTransport
 
                     if (length > 0)
                     {
-                        if (await ReadExactAsync(buf, 24, length).ConfigureAwait(false) < length)
+                        if (await ReadExactAsync(buf, 24, length, idleFirstByte: false).ConfigureAwait(false) < length)
                             break;
                         Logger.Hex(this, "RX ←client:", buf, 24 + length);
                     }
@@ -1120,13 +1120,50 @@ public sealed partial class EIPServerTransport
         /// Returns the number of bytes read; a value less than
         /// <paramref name="count"/> indicates EOF or connection closure.
         /// </summary>
-        private async Task<int> ReadExactAsync(byte[] buf, int offset, int count)
+        // A partially-sent request must complete within this window. Applies only
+        // once bytes have started arriving mid-message — a fully idle but
+        // connected client (e.g. RSLinx between polls) is left alone.
+        private const int PARTIAL_REQUEST_TIMEOUT_MS = 10_000;
+
+        /// <summary>
+        /// Reads exactly <paramref name="count"/> bytes. When
+        /// <paramref name="idleFirstByte"/> is true the initial read may wait
+        /// indefinitely (a connected client legitimately idles between requests);
+        /// but once any byte of a message has arrived, the remainder must complete
+        /// within <see cref="PARTIAL_REQUEST_TIMEOUT_MS"/>. This defeats a
+        /// slow-loris client that sends a partial header/payload and then stalls,
+        /// which would otherwise pin an EIPClient slot forever.
+        /// <para>
+        /// Note: NetworkStream.ReadTimeout is intentionally NOT used — it applies
+        /// only to synchronous Read() and is ignored by ReadAsync(). The timeout
+        /// must be enforced with a CancellationToken.
+        /// </para>
+        /// </summary>
+        private async Task<int> ReadExactAsync(byte[] buf, int offset, int count, bool idleFirstByte)
         {
             int total = 0;
             while (total < count)
             {
-                int n = await _stream.ReadAsync(buf, offset + total, count - total)
-                                     .ConfigureAwait(false);
+                int n;
+                if (total == 0 && idleFirstByte)
+                {
+                    // Waiting for the next request — allow a long idle.
+                    n = await _stream.ReadAsync(buf, offset, count).ConfigureAwait(false);
+                }
+                else
+                {
+                    // Mid-message: bound the wait so a stalled partial request is dropped.
+                    using var cts = new CancellationTokenSource(PARTIAL_REQUEST_TIMEOUT_MS);
+                    try
+                    {
+                        n = await _stream.ReadAsync(buf, offset + total, count - total, cts.Token)
+                                         .ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        throw new IOException("Partial EIP request timed out — dropping connection.");
+                    }
+                }
                 if (n == 0) break;
                 total += n;
             }

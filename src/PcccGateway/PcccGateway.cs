@@ -222,6 +222,7 @@ public class Gateway : IDisposable
 
     private void OnPlcFrameReceived(object? sender, byte[] replyPdu)
     {
+        if (_disposed) return;   // a late frame after teardown must not be routed
         if (replyPdu.Length < 6) return;
 
         ushort gwTns = (ushort)(replyPdu[4] | (replyPdu[5] << 8));

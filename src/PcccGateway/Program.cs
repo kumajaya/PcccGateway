@@ -88,7 +88,8 @@ class Program
                 case "--rs485-deassert-delay" when i + 1 < args.Length: if (int.TryParse(args[++i], out var dd)) rs485Deassrt = dd; break;
                 case "--echo-suppression": echoSuppr = true; break;
                 case "--lsap-control" when i + 1 < args.Length:
-                    _ = byte.TryParse(args[++i], NumberStyles.HexNumber, null, out lsapControl);
+                    if (!byte.TryParse(args[++i], NumberStyles.HexNumber, null, out lsapControl))
+                        Console.Error.WriteLine("Warning: invalid --lsap-control (expected hex), using 0x00.");
                     break;
                 case "--parity" when i + 1 < args.Length:
                     parity = args[++i].ToLowerInvariant() switch
