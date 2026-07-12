@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <RuntimeIdentifiers>win-x64;linux-x64;osx-x64</RuntimeIdentifiers>
+    <AssemblyName>PcccGateway</AssemblyName>
+    <RootNamespace>PcccGateway</RootNamespace>
+
+    <!-- Package / assembly metadata -->
+    <Authors>Ketut Kumajaya</Authors>
+    <Product>PcccGateway</Product>
+    <Description>Software PCCC protocol gateway — a 1761-NET-ENI replacement bridging EtherNet/IP clients to legacy PLCs over DF1, CSPv4, and EIP.</Description>
+    <Copyright>Copyright (c) 2026 Ketut Kumajaya</Copyright>
+    <PackageLicenseExpression>LGPL-3.0-or-later</PackageLicenseExpression>
+    <RepositoryUrl>https://github.com/kumajaya/PcccGateway</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageProjectUrl>https://github.com/kumajaya/PcccGateway</PackageProjectUrl>
+    <Version>0.1.0</Version>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.IO.Ports" Version="8.0.0" />
+  </ItemGroup>
+
+</Project>

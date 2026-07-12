@@ -1,0 +1,9 @@
+# Normalize line endings across platforms.
+* text=auto
+
+# Force LF for shell scripts (must stay LF even on Windows checkouts).
+*.sh text eol=lf
+
+# C# sources use CRLF on Windows checkouts.
+*.cs text eol=crlf
+*.csproj text eol=crlf

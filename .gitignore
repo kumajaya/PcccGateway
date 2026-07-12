@@ -1,0 +1,41 @@
+# ── Build output ──
+bin/
+obj/
+[Bb]in/
+[Oo]bj/
+
+# ── .NET / MSBuild ──
+*.dll
+*.exe
+*.pdb
+project.lock.json
+artifacts/
+TestResults/
+[Tt]est[Rr]esults/
+
+# ── NuGet ──
+*.nupkg
+*.snupkg
+packages/
+
+# ── Visual Studio ──
+.vs/
+*.user
+*.suo
+*.userprefs
+*.rsuser
+
+# ── VS Code ──
+.vscode/
+
+# ── JetBrains Rider ──
+.idea/
+*.sln.iml
+
+# ── Runtime / misc ──
+*.log
+*.db
+
+# ── OS cruft ──
+.DS_Store
+Thumbs.db
