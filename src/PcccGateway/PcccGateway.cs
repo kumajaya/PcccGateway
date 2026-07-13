@@ -452,13 +452,22 @@ public class Gateway : IDisposable
     // NOT consistent (e.g. PLC-5/40E is PCCC 0x4B but CIP Product Code 23; SLC-5/05
     // happens to match, MicroLogix 1400 does not). Product Type also varies (12 vs 14),
     // so nothing is hardcoded here.
-    private static readonly Dictionary<byte, (ushort type, ushort code, byte revMaj, byte revMin, string name)> EdsIdentity = new()
+    // NOTE: the PLC-5 expansion byte and the SLC/MicroLogix processor type are
+    // DIFFERENT namespaces — the same byte can mean different things (e.g. 0x15 is
+    // PLC-5/40B on a PLC-5 but an SLC-5/05 variant on an SLC). They must therefore
+    // be kept in separate tables and selected by family, never looked up by byte
+    // value alone.
+    private static readonly Dictionary<byte, (ushort type, ushort code, byte revMaj, byte revMin, string name)> Plc5Identity = new()
     {
-        // PLC-5 Ethernet (1785-Lx0E, series C–E)
-        [0x4A] = (14, 22,  1, 0, "PLC-5/20E"),
-        [0x4B] = (14, 23,  1, 0, "PLC-5/40E"),
-        [0x59] = (14, 24,  1, 0, "PLC-5/80E"),
-        // MicroLogix
+        // PLC-5 Ethernet (1785-Lx0E, series C–E) — keyed by expansion byte
+        [0x4A] = (14, 22, 1, 0, "PLC-5/20E"),
+        [0x4B] = (14, 23, 1, 0, "PLC-5/40E"),
+        [0x59] = (14, 24, 1, 0, "PLC-5/80E"),
+    };
+
+    private static readonly Dictionary<byte, (ushort type, ushort code, byte revMaj, byte revMin, string name)> SlcMlIdentity = new()
+    {
+        // MicroLogix — keyed by processor type
         [0x9F] = (14, 90,  2, 0, "MicroLogix 1400"),
         [0x90] = (14, 90,  2, 0, "MicroLogix 1400"),
         [0xB9] = (12, 185, 2, 0, "MicroLogix 1100"),
@@ -471,9 +480,8 @@ public class Gateway : IDisposable
         [0x14] = (14, 20,  3, 6, "SLC 5/05"),
         [0x15] = (14, 21,  3, 0, "SLC 5/05"),
         // Older SLC 500 (5/01–5/04) have NO native EtherNet/IP — EIP arrived with the
-        // 5/05. They are presented with the SLC 5/05 EtherNet/IP identity (Type 14,
-        // Code 20) so RSLinx can reach them over EtherNet/IP through the gateway; the
-        // real processor is still revealed by the client's own PCCC query.
+        // 5/05, so they are presented with the SLC 5/05 identity (Type 14, Code 20).
+        // The real processor is still revealed by the client's own PCCC query.
         [0x88] = (14, 20,  3, 6, "SLC 5/01"),
         [0x89] = (14, 20,  3, 6, "SLC 5/02"),
         [0x49] = (14, 20,  3, 6, "SLC 5/03"),
@@ -502,7 +510,8 @@ public class Gateway : IDisposable
             ? payload[2]                                       // PLC-5: expansion byte
             : (payload.Length > 3 ? payload[3] : (byte)0);     // SLC/ML: extended processor type
 
-        if (EdsIdentity.TryGetValue(procType, out var id))
+        var table = isPlc5 ? Plc5Identity : SlcMlIdentity;
+        if (table.TryGetValue(procType, out var id))
         {
             _eipTransport.SetProductIdentity(id.type, id.code, id.revMaj, id.revMin, id.name);
             return true;
