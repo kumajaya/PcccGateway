@@ -488,19 +488,22 @@ public class Gateway : IDisposable
         [0x5B] = (14, 20,  3, 6, "SLC 5/04"),
     };
 
+    /// <summary>A resolved CIP identity for the EIP server to advertise.</summary>
+    internal readonly record struct PlcIdentity(
+        ushort DeviceType, ushort ProductCode, byte RevMajor, byte RevMinor, string Name);
+
     /// <summary>
-    /// Builds a CIP Identity from a Get Diagnostic Status payload (AB Pub 1770-6.5.16).
-    /// The PCCC processor type is looked up in the EDS-derived table for an accurate
-    /// CIP Product Type / Code / Name that RSLinx recognises via its own EDS database.
-    /// Unknown processors fall back to a generic non-ENI PLC identity (Device Type 14)
-    /// with the name the PLC reports in its catalog string.
+    /// Pure resolver: maps a Get Diagnostic Status DATA payload to a CIP identity,
+    /// using the EDS-derived, family-specific tables (AB Pub 1770-6.5.16). Returns
+    /// null only when the payload is too short to classify. Extracted from the
+    /// side-effecting apply path so it can be unit-tested against sample captures.
     /// </summary>
-    private bool ApplyDiscoveredIdentity(byte[] payload)
+    internal static PlcIdentity? ResolveIdentity(byte[] payload)
     {
-        if (payload.Length < 5) return false;
+        if (payload.Length < 5) return null;
 
         // Family from the type-extender byte, processor type from a family-specific
-        // offset (AB Pub 1770-6.5.16). Verified against real hardware captures:
+        // offset. Verified against real hardware captures:
         //   PLC-5/40E : payload = 06 EB 4B ...  → byte[1]=0xEB (nibble 0xB) → expansion byte[2]=0x4B
         //   ML 1400   : payload = 00 EE 4A 9F ...→ byte[1]=0xEE (nibble 0xE) → proc type byte[3]=0x9F
         byte typeExtender = payload[1];
@@ -510,33 +513,30 @@ public class Gateway : IDisposable
             ? payload[2]                                       // PLC-5: expansion byte
             : (payload.Length > 3 ? payload[3] : (byte)0);     // SLC/ML: extended processor type
 
+        // Look up in the family-specific table (the PLC-5 and SLC/ML byte namespaces
+        // overlap, e.g. 0x15, so the byte must never be looked up without its family).
         var table = isPlc5 ? Plc5Identity : SlcMlIdentity;
         if (table.TryGetValue(procType, out var id))
-        {
-            _eipTransport.SetProductIdentity(id.type, id.code, id.revMaj, id.revMin, id.name);
-            return true;
-        }
+            return new PlcIdentity(id.type, id.code, id.revMaj, id.revMin, id.name);
 
-        // Unknown processor type: fall back to the family's most representative
-        // EtherNet/IP-capable identity, so RSLinx still recognises it (and picks the
-        // correct read protocol) instead of seeing an unknown product code. The family
-        // is always known from the type-extender byte even when the exact type is not.
+        // Unknown processor type → the family's most representative EtherNet/IP-capable
+        // identity, so RSLinx still recognises it (and picks the correct read protocol).
         if (isPlc5)
-        {
-            // Unknown PLC-5 → PLC-5/40E (Type 14, Code 23), the common PLC-5E.
-            _eipTransport.SetProductIdentity(14, 23, 1, 0, "PLC-5");
-        }
-        else
-        {
-            // Unknown SLC/MicroLogix → SLC 5/05 (Type 14, Code 20), the EtherNet/IP SLC.
-            // Keep the catalog string the PLC reported as the display name.
-            int end = Math.Min(16, payload.Length);
-            string catalog = end > 5
-                ? System.Text.Encoding.ASCII.GetString(payload, 5, end - 5).Trim('\0', ' ')
-                : string.Empty;
-            string name = string.IsNullOrWhiteSpace(catalog) ? "SLC 5/05" : catalog;
-            _eipTransport.SetProductIdentity(14, 20, 3, 6, name);
-        }
+            return new PlcIdentity(14, 23, 1, 0, "PLC-5");   // → PLC-5/40E
+
+        // Unknown SLC/MicroLogix → SLC 5/05; keep the catalog string it reported.
+        int end = Math.Min(16, payload.Length);
+        string catalog = end > 5
+            ? System.Text.Encoding.ASCII.GetString(payload, 5, end - 5).Trim('\0', ' ')
+            : string.Empty;
+        string name = string.IsNullOrWhiteSpace(catalog) ? "SLC 5/05" : catalog;
+        return new PlcIdentity(14, 20, 3, 6, name);
+    }
+
+    private bool ApplyDiscoveredIdentity(byte[] payload)
+    {
+        if (ResolveIdentity(payload) is not { } id) return false;
+        _eipTransport.SetProductIdentity(id.DeviceType, id.ProductCode, id.RevMajor, id.RevMinor, id.Name);
         return true;
     }
 
