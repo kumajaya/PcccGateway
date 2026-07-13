@@ -89,7 +89,7 @@ public class Gateway : IDisposable
     public int ReconnectMaxDelayMs { get; set; } = 30_000;
 
     private volatile bool _running;
-    private bool _disposed;
+    private volatile bool _disposed;
 
     /// <summary>
     /// Raised when a PDU is forwarded from EIP to the PLC transport.
@@ -349,7 +349,7 @@ public class Gateway : IDisposable
         }
         catch (OperationCanceledException)
         {
-            return true;
+            return true;   // shutdown requested
         }
         return ct.IsCancellationRequested || !_running;
     }
@@ -548,6 +548,11 @@ public class Gateway : IDisposable
         _disposed = true;
         Stop();
         _eipTransport.Dispose();
-        _linkWake.Dispose();
+
+        // _linkWake is intentionally NOT disposed. It is touched by the supervisor
+        // task (Reset/Wait) and by OnEipPduReceived (Set); Stop() only waits up to
+        // 2 s for the supervisor to exit, so disposing here could race a still-live
+        // thread into an ObjectDisposedException. As a process-lifetime singleton,
+        // leaving the lightweight event to finalization is the race-free choice.
     }
 }
