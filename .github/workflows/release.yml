@@ -1,0 +1,97 @@
+name: Build and Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: 'Create GitHub Release?'
+        required: true
+        default: false
+        type: boolean
+      tag_name:
+        description: 'Tag name for release (e.g. v1.0.0)'
+        required: false
+        type: string
+      release_name:
+        description: 'Release title (optional)'
+        required: false
+        type: string
+      prerelease:
+        description: 'Mark as pre-release?'
+        required: true
+        default: false
+        type: boolean
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        runtime: [win-x64, linux-x64, osx-x64]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Publish (self-contained single-file)
+        run: |
+          dotnet publish src/PcccGateway/PcccGateway.csproj \
+            --configuration Release \
+            --runtime ${{ matrix.runtime }} \
+            --self-contained true \
+            -p:PublishSingleFile=true \
+            -p:EnableCompressionInSingleFile=true \
+            -p:IncludeNativeLibrariesForSelfExtract=true \
+            -o ./publish/${{ matrix.runtime }}
+
+      - name: Zip output
+        shell: bash
+        run: |
+          zip_name="PcccGateway-${{ matrix.runtime }}.zip"
+          cd "$GITHUB_WORKSPACE"
+          zip -r "$zip_name" "./publish/${{ matrix.runtime }}/"
+          ls -lh "$zip_name"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: PcccGateway-${{ matrix.runtime }}
+          path: ${{ github.workspace }}/PcccGateway-${{ matrix.runtime }}.zip
+          if-no-files-found: error
+
+  release:
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    if: github.event.inputs.create_release == 'true'
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: ./artifacts
+
+      - name: Determine tag name
+        id: tag
+        run: |
+          if [ -n "${{ github.event.inputs.tag_name }}" ]; then
+            echo "tag=${{ github.event.inputs.tag_name }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=build-$(date +'%Y%m%d-%H%M%S')" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create GitHub Release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ github.event.inputs.release_name || steps.tag.outputs.tag }}
+          draft: false
+          prerelease: ${{ github.event.inputs.prerelease == 'true' }}
+          files: ./artifacts/**/*.zip
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
