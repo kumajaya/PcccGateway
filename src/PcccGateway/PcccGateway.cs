@@ -109,10 +109,10 @@ public class Gateway : IDisposable
     /// or CSPTransport). Must already be configured with appropriate settings.
     /// </param>
     /// <param name="eipPort">TCP port for the EIP server (default 44818).</param>
-    public Gateway(ITransport plcTransport, int eipPort = 44818)
+    public Gateway(ITransport plcTransport, int eipPort = 44818, System.Net.IPAddress? bindAddress = null)
     {
         _plcTransport = plcTransport ?? throw new ArgumentNullException(nameof(plcTransport));
-        _eipTransport = new EIPServerTransport(eipPort);
+        _eipTransport = new EIPServerTransport(eipPort, bindAddress);
 
         _eipTransport.PduReceived += OnEipPduReceived;
         _plcTransport.FrameReceived += OnPlcFrameReceived;

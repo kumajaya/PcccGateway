@@ -80,11 +80,29 @@ flowchart LR
 - [.NET 8 SDK](https://dotnet.microsoft.com/download)
 - A serial port (for DF1) or network access to the target PLC (for CSPv4 / EIP)
 
+## Repository layout
+
+```
+PcccGateway/
+├── PcccGateway.sln            solution (main project + tests)
+├── src/PcccGateway/           the gateway (Client/ Common/ Interface/ Server/)
+└── tests/PcccGateway.Tests/   xUnit unit tests
+```
+
 ## Building
 
 ```bash
-dotnet build -c Release
+dotnet build -c Release        # builds the whole solution
 ```
+
+## Testing
+
+```bash
+dotnet test                    # runs the xUnit suite (no hardware required)
+```
+
+Current coverage: DF1 CRC-16 / BCC checksum, DLE stuffing round-trip, and the
+receive-path ring buffer.
 
 ## Running
 
@@ -125,6 +143,7 @@ dotnet run -c Release -- --mode eip --host 192.168.1.10
 | `--plc-eip-port <n>` | eip | PLC EtherNet/IP port | `44818` |
 | `--lsap-control <hex>` | csp | CSP LSAP control byte | `00` |
 | `--listen-port <n>` | all | EIP **server** listen port (frontend) | `44818` |
+| `--bind <ip>` | all | Bind EIP server to one interface (may disable RSLinx broadcast browse) | all interfaces |
 | `--quiet`, `-q` | all | Disable logging for max performance | off |
 | `--help`, `-h` | — | Show usage | — |
 
@@ -152,4 +171,5 @@ multi-element, mode switching, memory init, and read-modify-write.
 ## License
 
 GNU Lesser General Public License v3.0 or later (LGPL-3.0-or-later).
+
 Copyright (c) 2026 Ketut Kumajaya.

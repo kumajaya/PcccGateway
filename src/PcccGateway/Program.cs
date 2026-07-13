@@ -63,6 +63,7 @@ class Program
         int    cspPort     = 2222;
         int    plcEipPort  = 44818;
         int    listenPort  = EIPServerTransport.EIP_DEFAULT_PORT; // frontend
+        System.Net.IPAddress? bindAddr = null; // EIP server bind interface (default all)
         bool   quiet       = false;
 
         // ── Parse arguments (pattern mirrors the PCCCComm example client) ────
@@ -82,6 +83,19 @@ class Program
                 case "--csp-port" when i + 1 < args.Length: if (int.TryParse(args[++i], out var c))  cspPort    = c;  break;
                 case "--plc-eip-port" when i + 1 < args.Length: if (int.TryParse(args[++i], out var pe)) plcEipPort = pe; break;
                 case "--listen-port"  when i + 1 < args.Length: if (int.TryParse(args[++i], out var lp)) listenPort = lp; break;
+                case "--bind"         when i + 1 < args.Length:
+                    if (!System.Net.IPAddress.TryParse(args[++i], out bindAddr))
+                    {
+                        Console.Error.WriteLine("Warning: invalid --bind address, binding to all interfaces.");
+                    }
+                    else if (bindAddr.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork)
+                    {
+                        // EtherNet/IP's List Identity socket-address field is IPv4-only
+                        // (sin_family = AF_INET); an IPv6 bind would corrupt that payload.
+                        Console.Error.WriteLine("Warning: --bind requires an IPv4 address; binding to all interfaces.");
+                        bindAddr = null;
+                    }
+                    break;
                 case "--checksum"           when i + 1 < args.Length: checksum   = args[++i].ToLowerInvariant(); break;
                 case "--rs485-mode"         when i + 1 < args.Length: rs485Mode  = args[++i].ToLowerInvariant(); break;
                 case "--rs485-assert-delay"   when i + 1 < args.Length: if (int.TryParse(args[++i], out var ad)) rs485Assert  = ad; break;
@@ -179,7 +193,7 @@ class Program
         }
 
         // ── Start the gateway ────────────────────────────────────────────────
-        using var gateway = new Gateway(plcTransport, eipPort: listenPort);
+        using var gateway = new Gateway(plcTransport, eipPort: listenPort, bindAddress: bindAddr);
 
         gateway.PduForwarded      += (s, e) => Logger.Info(null, $"[FWD] gwTNS=0x{e.tns:X4} len={e.pdu.Length}");
         gateway.PduReplyForwarded += (s, e) => Logger.Info(null, $"[REP] TNS=0x{e.tns:X4} len={e.pdu.Length}");
@@ -221,7 +235,7 @@ class Program
         {
             Console.WriteLine($"      PLC host    : {host}:{plcEipPort}");
         }
-        Console.WriteLine($"      EIP listen  : {listenPort}");
+        Console.WriteLine($"      EIP listen  : {(bindAddr?.ToString() ?? "0.0.0.0")}:{listenPort}");
         Console.WriteLine($"      Logging     : {(quiet ? "Disabled (High Performance)" : "Enabled")}");
         Console.WriteLine();
         Console.WriteLine("Connect your EIP client (RSLinx, libplctag, pycomm3, etc.) to this gateway.");
@@ -275,6 +289,8 @@ class Program
         Console.WriteLine();
         Console.WriteLine("Frontend (EIP server) and misc:");
         Console.WriteLine("  --listen-port <n>               EIP server listen port (default 44818)");
+        Console.WriteLine("  --bind <ip>                     Bind EIP server to one interface (default all;");
+        Console.WriteLine("                                  note: binding may disable RSLinx broadcast browse)");
         Console.WriteLine("  --quiet, -q                     Disable logging for maximum performance");
         Console.WriteLine("  --help, -h                      Show this help");
         Console.WriteLine();

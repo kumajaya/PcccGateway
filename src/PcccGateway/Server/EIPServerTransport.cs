@@ -73,6 +73,7 @@ public partial class EIPServerTransport : IServerTransport, IDisposable
     // ── External dependencies ────────────────────────────────────────────────
 
     private readonly int _port;
+    private readonly System.Net.IPAddress _bindAddress;
 
     // ── TCP server ───────────────────────────────────────────────────────────
 
@@ -230,9 +231,10 @@ public partial class EIPServerTransport : IServerTransport, IDisposable
 
     // ── Construction ─────────────────────────────────────────────────────────
 
-    public EIPServerTransport(int port = EIP_DEFAULT_PORT)
+    public EIPServerTransport(int port = EIP_DEFAULT_PORT, System.Net.IPAddress? bindAddress = null)
     {
         _port         = port;
+        _bindAddress  = bindAddress ?? System.Net.IPAddress.Any;
         _identityData = BuildIdentityData(EIP_DEVICE_TYPE, EIP_PRODUCT_CODE, EIP_REV_MAJOR, EIP_REV_MINOR, EIP_PRODUCT_NAME);
     }
 
@@ -248,7 +250,7 @@ public partial class EIPServerTransport : IServerTransport, IDisposable
         _cts       = new CancellationTokenSource();
 
         // TCP listener — accepts RSLinx, pycomm3, libplctag sessions.
-        _listener = new TcpListener(IPAddress.Any, _port);
+        _listener = new TcpListener(_bindAddress, _port);
         _listener.Start();
         _acceptLoopTask = Task.Run(AcceptClientsAsync, _cts.Token);
 
@@ -256,7 +258,7 @@ public partial class EIPServerTransport : IServerTransport, IDisposable
         // visible in RSLinx "Browse Network" without a manual IP entry.
         try
         {
-            _udpListener = new UdpClient(_port);
+            _udpListener = new UdpClient(new IPEndPoint(_bindAddress, _port));
             _udpTask     = Task.Run(HandleUdpBroadcastAsync, _cts.Token);
         }
         catch (Exception ex)
