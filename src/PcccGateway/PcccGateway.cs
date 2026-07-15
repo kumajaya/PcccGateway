@@ -17,7 +17,6 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 using System.Collections.Concurrent;
-using PcccGateway.Client;
 using PcccGateway.Common;
 using PcccGateway.Interface;
 using PcccGateway.Server;
@@ -51,15 +50,15 @@ public class Gateway : IDisposable
     // client's TNS before handing it to the originating client. Gateway TNS
     // values are unique across all clients, so cross-client collisions cannot
     // happen and same-client reuse is harmless.
-    private sealed class Pending
+    internal sealed class Pending
     {
         public required object Context;      // originating EIPRequestContext
         public required ushort OriginalTns;  // client's TNS, restored in the reply
         public required long   StampTicks;   // Environment.TickCount64 at send time
     }
 
-    private readonly ConcurrentDictionary<ushort, Pending> _pending = new();
-    private int _tnsCounter;                 // wraps naturally through the ushort range
+    internal readonly ConcurrentDictionary<ushort, Pending> _pending = new();
+    internal int _tnsCounter;                 // wraps naturally through the ushort range
     private readonly object _tnsLock = new object();
     private Timer? _evictTimer;
 
@@ -257,7 +256,7 @@ public class Gateway : IDisposable
     /// hand out the same value.
     /// </summary>
     /// <exception cref="InvalidOperationException">Thrown when the TNS pool is exhausted (all 65535 values in use).</exception>
-    private ushort AllocateGatewayTns(object context, ushort originalTns)
+    internal ushort AllocateGatewayTns(object context, ushort originalTns)
     {
         lock (_tnsLock)
         {
@@ -291,7 +290,7 @@ public class Gateway : IDisposable
     /// Uses a snapshot of keys to avoid modifying the collection
     /// while enumerating it, which would throw InvalidOperationException.
     /// </summary>
-    private void EvictStale()
+    internal void EvictStale()
     {
         if (_disposed) return;
         long now = Environment.TickCount64;

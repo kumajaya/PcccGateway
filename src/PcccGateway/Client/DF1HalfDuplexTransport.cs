@@ -405,7 +405,12 @@ public class DF1HalfDuplexTransport : DF1BaseTransport
                 bool signaled = _stateEvent.Wait(PollResponseTimeoutMs);
 
                 if (_closing) return null;
-                if (!signaled) break; // timeout
+                if (!signaled)
+                {
+                    // Timeout — continue polling instead of breaking out
+                    // This allows MaxPollAttempts to govern retries.
+                    continue;
+                }
 
                 if (_responseDataReceived && _responseDataFrame != null)
                 {

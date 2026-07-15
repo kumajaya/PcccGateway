@@ -24,10 +24,11 @@ namespace PcccGateway.Client;
 
 /// <summary>
 /// Serial port wrapper with robust byte array handling and deadlock prevention.
+/// Supports dependency injection for testing via <see cref="ISerialPort"/>.
 /// </summary>
 public class SerialPortWrapper : ISerialPort
 {
-    private readonly SerialPort _port;
+    private readonly ISerialPort _port;
     private readonly object _sync = new object();
 
     // Received chunks are handed off through this channel instead of being dispatched
@@ -46,46 +47,44 @@ public class SerialPortWrapper : ISerialPort
     public event EventHandler<byte[]>? BytesReceived;
 
     public int BaudRate => _port.BaudRate;
-
     public Parity Parity => _port.Parity;
+    public int BytesToRead => _port.BytesToRead;
 
+    /// <summary>
+    /// Initializes a new instance of the <see cref="SerialPortWrapper"/> class
+    /// with a real serial port.
+    /// </summary>
     public SerialPortWrapper(string portName, int baudRate, Parity parity)
+        : this(new SystemSerialPort(portName, baudRate, parity))
     {
-        _port = new SerialPort(portName, baudRate, parity, 8, StopBits.One)
-        {
-            ReadTimeout = 2000,
-            WriteTimeout = 2000
-        };
-        _port.DataReceived += Port_DataReceived;
+    }
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="SerialPortWrapper"/> class
+    /// with a custom <see cref="ISerialPort"/> (for testing).
+    /// </summary>
+    public SerialPortWrapper(ISerialPort port)
+    {
+        _port = port ?? throw new ArgumentNullException(nameof(port));
+        _port.BytesReceived += OnBytesReceived;
         _rxDispatchTask = Task.Run(DispatchLoopAsync);
     }
 
-    private void Port_DataReceived(object sender, SerialDataReceivedEventArgs e)
+    private void OnBytesReceived(object? sender, byte[] chunk)
     {
+        if (chunk == null || chunk.Length == 0) return;
+
         try
         {
-            int toRead = _port.BytesToRead;
-            if (toRead <= 0) return;
-
-            byte[] buffer = new byte[toRead];
-            int read = _port.Read(buffer, 0, toRead);
-
-            if (read > 0)
-            {
-                // Crop buffer to actual bytes read
-                byte[] actualData = new byte[read];
-                Buffer.BlockCopy(buffer, 0, actualData, 0, read);
-
-                // TryWrite on an unbounded channel never blocks and never fails
-                // (short of the channel already being completed at shutdown), so this
-                // returns immediately — the driver's callback thread is not held up
-                // waiting for the handler to run.
-                _rxChannel.Writer.TryWrite(actualData);
-            }
+            // TryWrite on an unbounded channel never blocks and never fails
+            // (short of the channel already being completed at shutdown), so this
+            // returns immediately — the driver's callback thread is not held up
+            // waiting for the handler to run.
+            _rxChannel.Writer.TryWrite(chunk);
         }
         catch
         {
-            // Ignore serial port read errors; upper layer will timeout
+            // Ignore; upper layer will timeout
         }
     }
 
@@ -160,12 +159,20 @@ public class SerialPortWrapper : ISerialPort
         set { lock (_sync) { _port.DtrEnable = value; } }
     }
 
+    public int Read(byte[] buffer, int offset, int count)
+    {
+        lock (_sync)
+        {
+            return _port.Read(buffer, offset, count);
+        }
+    }
+
     public void Dispose()
     {
         try
         {
-            _port.DataReceived -= Port_DataReceived;
-            Close();
+            _port.BytesReceived -= OnBytesReceived;
+            _port.Close();
             _port.Dispose();
         }
         catch { }
@@ -179,5 +186,69 @@ public class SerialPortWrapper : ISerialPort
             _rxDispatchTask.Wait(2000);
         }
         catch { }
+    }
+
+    /// <summary>
+    /// Wraps a real <see cref="SerialPort"/> to implement <see cref="ISerialPort"/>.
+    /// </summary>
+    private sealed class SystemSerialPort : ISerialPort
+    {
+        private readonly SerialPort _port;
+
+        public event EventHandler<byte[]>? BytesReceived;
+
+        public bool IsOpen => _port.IsOpen;
+        public int BaudRate => _port.BaudRate;
+        public Parity Parity => _port.Parity;
+        public int BytesToRead => _port.BytesToRead;
+
+        public bool RtsEnable
+        {
+            get => _port.RtsEnable;
+            set => _port.RtsEnable = value;
+        }
+
+        public bool DtrEnable
+        {
+            get => _port.DtrEnable;
+            set => _port.DtrEnable = value;
+        }
+
+        public SystemSerialPort(string portName, int baudRate, Parity parity)
+        {
+            _port = new SerialPort(portName, baudRate, parity, 8, StopBits.One)
+            {
+                ReadTimeout = 2000,
+                WriteTimeout = 2000
+            };
+            _port.DataReceived += (s, e) =>
+            {
+                try
+                {
+                    int toRead = _port.BytesToRead;
+                    if (toRead <= 0) return;
+
+                    byte[] buffer = new byte[toRead];
+                    int read = _port.Read(buffer, 0, toRead);
+
+                    if (read > 0)
+                    {
+                        byte[] actualData = new byte[read];
+                        Buffer.BlockCopy(buffer, 0, actualData, 0, read);
+                        BytesReceived?.Invoke(this, actualData);
+                    }
+                }
+                catch
+                {
+                    // Ignore serial port read errors; upper layer will timeout
+                }
+            };
+        }
+
+        public void Open() => _port.Open();
+        public void Close() => _port.Close();
+        public void Write(byte[] buffer, int offset, int count) => _port.Write(buffer, offset, count);
+        public int Read(byte[] buffer, int offset, int count) => _port.Read(buffer, offset, count);
+        public void Dispose() => _port.Dispose();
     }
 }

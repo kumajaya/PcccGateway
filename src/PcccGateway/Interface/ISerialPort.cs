@@ -34,4 +34,10 @@ public interface ISerialPort : IDisposable
     bool DtrEnable { get; set; }
     int BaudRate { get; }
     Parity Parity { get; }
+
+    /// <summary>Number of bytes available to read.</summary>
+    int BytesToRead { get; }
+
+    /// <summary>Reads bytes from the port into the buffer.</summary>
+    int Read(byte[] buffer, int offset, int count);
 }
