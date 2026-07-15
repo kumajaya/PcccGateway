@@ -256,17 +256,22 @@ public class Gateway : IDisposable
     /// registers the pending correlation entry. Serialized so two threads never
     /// hand out the same value.
     /// </summary>
+    /// <exception cref="InvalidOperationException">Thrown when the TNS pool is exhausted (all 65535 values in use).</exception>
     private ushort AllocateGatewayTns(object context, ushort originalTns)
     {
         lock (_tnsLock)
         {
             ushort tns;
+            int attempts = 0;
             // Skip values already in flight. The pending map is bounded by the
             // number of concurrent outstanding requests, far below 65536, so
-            // this loop terminates quickly.
+            // this loop terminates quickly. However, add a safety counter to
+            // prevent an infinite loop if the map somehow becomes full.
             do
             {
                 tns = unchecked((ushort)Interlocked.Increment(ref _tnsCounter));
+                if (++attempts > 65535)
+                    throw new InvalidOperationException("Gateway TNS pool exhausted. Too many pending requests.");
             }
             while (tns == 0 || _pending.ContainsKey(tns));
 
@@ -283,17 +288,25 @@ public class Gateway : IDisposable
     /// <summary>
     /// Evicts correlation entries whose PLC reply never arrived within
     /// <see cref="PendingTimeoutMs"/>, so a silent PLC cannot leak memory.
+    /// Uses a snapshot of keys to avoid modifying the collection
+    /// while enumerating it, which would throw InvalidOperationException.
     /// </summary>
     private void EvictStale()
     {
         if (_disposed) return;
         long now = Environment.TickCount64;
-        foreach (var kv in _pending)
+
+        // Take a snapshot of stale requests and their pending values so a newer
+        // request reusing the same gwTNS is not evicted accidentally.
+        var staleEntries = _pending
+            .Where(kv => now - kv.Value.StampTicks > PendingTimeoutMs)
+            .ToList();
+
+        foreach (var kvp in staleEntries)
         {
-            if (now - kv.Value.StampTicks > PendingTimeoutMs &&
-                _pending.TryRemove(kv.Key, out _))
+            if (_pending.TryRemove(kvp))
             {
-                Logger.Warn(this, $"Evicted stale gwTNS=0x{kv.Key:X4} (no PLC reply in {PendingTimeoutMs} ms)");
+                Logger.Warn(this, $"Evicted stale gwTNS=0x{kvp.Key:X4} (no PLC reply in {PendingTimeoutMs} ms)");
             }
         }
     }
@@ -361,27 +374,40 @@ public class Gateway : IDisposable
     /// so RSLinx and friends see the real processor (a PLC), not a bridge. Runs on
     /// every successful (re)connect, so if the PLC behind the gateway is swapped —
     /// which drops and re-establishes the link — the advertised identity follows the
-    /// new hardware. Failure is non-fatal: the last-known (or fallback) identity is
-    /// kept, so clients keep talking directly.
+    /// new hardware. The last-known PLC identity is retained while the transport is
+    /// closed and reconnection is attempted.
+    ///
+    /// If the probe fails due to no response or transport error, the PLC transport is
+    /// closed to force a reconnect. This prevents the gateway from hanging
+    /// indefinitely when the PLC is unresponsive but the TCP connection remains open.
     /// </summary>
     private void TryDiscoverIdentity(CancellationToken ct)
     {
         try
         {
             byte[]? payload = ProbeDiagnosticStatus(ct);
-            if (payload != null)
+            if (payload != null && payload.Length > 0)
             {
                 Logger.Hex(this, "Diagnostic Status", payload, payload.Length);
                 ApplyDiscoveredIdentity(payload);   // updates identity if the PLC changed
             }
+            else if (payload != null)
+            {
+                Logger.Warn(this, "Identity discovery: PLC rejected diagnostic probe — retaining last-known identity");
+            }
             else
             {
-                Logger.Info(this, "Identity discovery: no PLC response — keeping current identity");
+                Logger.Info(this, "Identity discovery: no PLC response — forcing reconnect");
+                // Probe failed (timeout or no response). Close the transport to trigger
+                // a full reconnect cycle, which will re-run identity discovery.
+                _plcTransport.Close();
             }
         }
         catch (Exception ex)
         {
             Logger.Warn(this, $"Identity discovery error: {ex.Message}");
+            // On any exception during discovery, close the transport to attempt recovery.
+            try { _plcTransport.Close(); } catch { }
         }
     }
 
@@ -429,7 +455,10 @@ public class Gateway : IDisposable
                 if (reply.Length > 6 && reply[3] == 0x00)
                     return reply[6..];
                 if (reply.Length > 3 && reply[3] != 0x00)
+                {
                     Logger.Warn(this, $"Identity probe: PLC returned STS=0x{reply[3]:X2} — ignoring");
+                    return Array.Empty<byte>();
+                }
                 return null;
             }
         }

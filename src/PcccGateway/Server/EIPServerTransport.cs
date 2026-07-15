@@ -1102,6 +1102,18 @@ public sealed partial class EIPServerTransport
 
                     ushort command = (ushort)(buf[0] | (buf[1] << 8));
                     ushort length  = (ushort)(buf[2] | (buf[3] << 8));
+
+                    // The Length field is peer-controlled and, at the protocol level, can be
+                    // up to 65535 — enough that 24 (header) + length can exceed this fixed
+                    // 65536-byte buffer. Reject that here, explicitly and before it is used to
+                    // size a read, rather than letting Stream.ReadAsync's own bounds-check
+                    // throw an ArgumentException that gets logged as a generic session error.
+                    if (24 + length > buf.Length)
+                    {
+                        Logger.Warn(this, $"Rejected EIP request: length {length} exceeds receive buffer capacity — closing connection");
+                        break;
+                    }
+
                     // Session handle at offset 4 (uint, LE).
                     // Status at offset 8 — checked per-command where needed.
                     // Sender Context at offset 12 (uint64, LE) — will be echoed in reply.
@@ -1161,30 +1173,41 @@ public sealed partial class EIPServerTransport
         private async Task<int> ReadExactAsync(byte[] buf, int offset, int count, bool idleFirstByte)
         {
             int total = 0;
-            while (total < count)
+            CancellationTokenSource? cts = idleFirstByte ? null : new CancellationTokenSource(PARTIAL_REQUEST_TIMEOUT_MS);
+
+            try
             {
-                int n;
-                if (total == 0 && idleFirstByte)
+                while (total < count)
                 {
-                    // Waiting for the next request — allow a long idle.
-                    n = await _stream.ReadAsync(buf, offset, count).ConfigureAwait(false);
-                }
-                else
-                {
-                    // Mid-message: bound the wait so a stalled partial request is dropped.
-                    using var cts = new CancellationTokenSource(PARTIAL_REQUEST_TIMEOUT_MS);
-                    try
+                    int n;
+                    if (total == 0 && idleFirstByte)
                     {
-                        n = await _stream.ReadAsync(buf, offset + total, count - total, cts.Token)
-                                         .ConfigureAwait(false);
+                        n = await _stream.ReadAsync(buf, offset, 1).ConfigureAwait(false);
+                        if (n == 0) break;
+                        total += n;
+                        if (total < count)
+                            cts = new CancellationTokenSource(PARTIAL_REQUEST_TIMEOUT_MS);
+                        continue;
                     }
-                    catch (OperationCanceledException)
+                    else
                     {
-                        throw new IOException("Partial EIP request timed out — dropping connection.");
+                        try
+                        {
+                            n = await _stream.ReadAsync(buf, offset + total, count - total, cts!.Token)
+                                            .ConfigureAwait(false);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            throw new IOException("Partial EIP request timed out — dropping connection.");
+                        }
                     }
+                    if (n == 0) break;
+                    total += n;
                 }
-                if (n == 0) break;
-                total += n;
+            }
+            finally
+            {
+                cts?.Dispose();
             }
             return total;
         }
@@ -1428,6 +1451,7 @@ public sealed partial class EIPServerTransport
         private async Task HandleUnconnectedSend(byte[] buf, ushort length, EIPRequestContext context)
         {
             context.IsConnectedAtReceive = false;
+            int packetEnd = 24 + length;
 
             // Body starts immediately after the 24-byte EIP header.
             int offset = 24;
@@ -1435,13 +1459,13 @@ public sealed partial class EIPServerTransport
             // Interface Handle (4 bytes, always 0 for CIP) + Timeout (2 bytes).
             offset += 6;
 
-            if (offset + 2 > buf.Length) return;
+            if (offset + 2 > packetEnd) return;
             ushort itemCount = (ushort)(buf[offset] | (buf[offset + 1] << 8));
             offset += 2;
 
             for (int i = 0; i < itemCount; i++)
             {
-                if (offset + 4 > buf.Length) return;
+                if (offset + 4 > packetEnd) return;
                 ushort itemType   = (ushort)(buf[offset]     | (buf[offset + 1] << 8));
                 ushort itemLength = (ushort)(buf[offset + 2] | (buf[offset + 3] << 8));
                 offset += 4;
@@ -1451,12 +1475,19 @@ public sealed partial class EIPServerTransport
                 if (itemType == CPF_ITEM_NULL_ADDRESS)
                 {
                     // Null Address Item carries no data; skip it and continue.
+                    if (itemStart + itemLength > packetEnd) return;
                     offset = itemStart + itemLength;
                     continue;
                 }
 
                 if (itemType == CPF_ITEM_UNCONNECTED_DATA && itemLength > 0)
                 {
+                    if (itemStart + itemLength > packetEnd)
+                    {
+                        Logger.Warn(this, "Unconnected Send: declared item length exceeds packet boundary – dropping");
+                        return;
+                    }
+
                     byte svc = buf[offset];
 
                     if (svc == CIP_SERVICE_GET_ATTRIBUTES_ALL ||
@@ -1465,7 +1496,7 @@ public sealed partial class EIPServerTransport
                         await HandleGetAttributes(buf, offset, svc, context).ConfigureAwait(false);
                     }
                     else if (svc == CIP_SERVICE_FORWARD_OPEN ||
-                             svc == CIP_SERVICE_FORWARD_OPEN_EX)
+                            svc == CIP_SERVICE_FORWARD_OPEN_EX)
                     {
                         await HandleForwardOpen(buf, offset, itemLength,
                             isExtended: svc == CIP_SERVICE_FORWARD_OPEN_EX, context)
@@ -1484,15 +1515,27 @@ public sealed partial class EIPServerTransport
                         //   + ucCmdLength(2) + [pad if ucCmdLength is odd]
                         //   + embedded PCCC request
                         int inner = offset + 1;                        // skip service code
-                        if (inner >= buf.Length) return;
+                        if (inner >= packetEnd) return;
                         byte pathSize = buf[inner++];
+                        if (inner + pathSize * 2 > packetEnd) return;
                         inner += pathSize * 2;                         // skip CM object path
                         inner += 2;                                    // secsPerTick + timeoutTicks
-                        if (inner + 2 > buf.Length) return;
+                        if (inner + 2 > packetEnd) return;
                         ushort ucLen = (ushort)(buf[inner] | (buf[inner + 1] << 8));
                         inner += 2;
                         // Pad byte required when embedded command length is odd.
-                        if ((ucLen & 1) != 0 && inner < buf.Length) inner++;
+                        if ((ucLen & 1) != 0)
+                        {
+                            if (inner >= packetEnd) return;
+                            inner++;
+                        }
+
+                        // Validate that ucLen does not exceed the remaining packet.
+                        if (inner + ucLen > packetEnd)
+                        {
+                            Logger.Warn(this, "CM Unconnected Send: ucLen exceeds buffer – dropping");
+                            return;
+                        }
 
                         ExtractAndDispatchPCCC(buf, inner, ucLen, context);
                     }
@@ -1558,6 +1601,13 @@ public sealed partial class EIPServerTransport
                 }
                 else if (itemType == CPF_ITEM_CONNECTED_DATA && itemLength >= 2)
                 {
+                    // Validate that itemLength does not exceed the remaining buffer.
+                    if (offset + itemLength > buf.Length)
+                    {
+                        Logger.Warn(this, "Connected Send: itemLength exceeds buffer – dropping");
+                        return;
+                    }
+
                     // Read incoming sequence number (can be used for validation)
                     ushort incomingSeq = (ushort)(buf[offset] | (buf[offset + 1] << 8));
                     _ = incomingSeq;
@@ -1593,12 +1643,18 @@ public sealed partial class EIPServerTransport
         /// <param name="isExtended">True for Extended Forward Open (0x5B)</param>
         /// <param name="context">Request context (contains Sender Context for echo)</param>
         private async Task HandleForwardOpen(byte[] buf, int offset,
-                                             ushort length, bool isExtended, EIPRequestContext context)
+                                            ushort length, bool isExtended, EIPRequestContext context)
         {
             offset++;  // skip service code byte
             if (offset >= buf.Length) return;
 
             byte pathSize = buf[offset++];
+            // Validate pathSize does not exceed buffer.
+            if (offset + pathSize * 2 > buf.Length)
+            {
+                Logger.Warn(this, "Forward Open: pathSize exceeds buffer – dropping");
+                return;
+            }
             offset += pathSize * 2;  // skip connection path
 
             // Both standard and extended Forward Open share these fields.
@@ -1632,15 +1688,34 @@ public sealed partial class EIPServerTransport
                 IsActive = true
             };
 
-            lock (_connLock)
-                _connections[newId] = conn;
+            // Add connection to dictionary only after ensuring we can send response,
+            // or use try-finally to remove on failure.
+            bool added = false;
+            try
+            {
+                lock (_connLock)
+                {
+                    _connections[newId] = conn;
+                    added = true;
+                }
 
-            Logger.Info(this, $"ForwardOpen{(isExtended ? "Ex" : "")}: " +
-                $"OT=0x{otConnId:X8} TO=0x{toConnId:X8} → assigned TargID=0x{newId:X8}, " +
-                $"Active connections={_connections.Count}");
+                Logger.Info(this, $"ForwardOpen{(isExtended ? "Ex" : "")}: " +
+                    $"OT=0x{otConnId:X8} TO=0x{toConnId:X8} → assigned TargID=0x{newId:X8}, " +
+                    $"Active connections={_connections.Count}");
 
-            await SendForwardOpenResponse(newId, toConnId, connSerial, vendorId, serialNum, isExtended, context)
-                  .ConfigureAwait(false);
+                await SendForwardOpenResponse(newId, toConnId, connSerial, vendorId, serialNum, isExtended, context)
+                    .ConfigureAwait(false);
+            }
+            catch
+            {
+                // If response send fails, remove the connection to prevent leak.
+                if (added)
+                {
+                    lock (_connLock)
+                        _connections.Remove(newId);
+                }
+                throw;
+            }
         }
 
         /// <summary>
@@ -1832,9 +1907,14 @@ public sealed partial class EIPServerTransport
 
             // ── CIP path ────────────────────────────────────────────────────
             if (offset >= itemEnd || offset >= buf.Length) return;
-            byte pathSize  = buf[offset++];
-            int  pathBytes = pathSize * 2;
-            if (offset + pathBytes > buf.Length || offset + pathBytes > itemEnd) return;
+            byte pathSize = buf[offset++];
+            int pathBytes = pathSize * 2;
+            // Validate path size does not exceed bounds.
+            if (offset + pathBytes > buf.Length || offset + pathBytes > itemEnd)
+            {
+                Logger.Warn(this, "ExtractAndDispatchPCCC: pathSize exceeds buffer – dropping");
+                return;
+            }
             offset += pathBytes;
 
             // ── Request ID ──────────────────────────────────────────────────
@@ -1843,7 +1923,14 @@ public sealed partial class EIPServerTransport
             if (offset >= itemEnd || offset >= buf.Length) return;
             byte requestIdSize = buf[offset++];
 
-            int skipBytes = requestIdSize >= 1 ? requestIdSize - 1 : 0;
+            // Validate requestIdSize is exactly 7 (the standard size).
+            if (requestIdSize != 7)
+            {
+                Logger.Warn(this, $"ExtractAndDispatchPCCC: unexpected requestIdSize {requestIdSize} – dropping");
+                return;
+            }
+
+            int skipBytes = requestIdSize - 1; // since we already consumed the size byte
             if (offset + skipBytes > buf.Length || offset + skipBytes > itemEnd) return;
 
             // Store Request ID in the context object (not in instance field).
@@ -1890,9 +1977,6 @@ public sealed partial class EIPServerTransport
             _transport.IncrementFramesProcessed();
 
             // Raise PduReceived with the context object as clientContext.
-            // PCCCEngine will process the command and call SendResponse(pdu, context)
-            // when the reply is ready. The context contains SenderContext and RequestId
-            // needed to build the response.
             _transport.PduReceived?.Invoke(this, (pdu, context));
         }
 

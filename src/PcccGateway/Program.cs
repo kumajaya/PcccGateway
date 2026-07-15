@@ -249,6 +249,7 @@ class Program
         stop.Wait();
 
         gateway.Stop();
+        Logger.Shutdown();
         Console.WriteLine("Gateway stopped.");
         return 0;
     }

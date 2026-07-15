@@ -19,6 +19,7 @@
 using System.Net.Sockets;
 using System.Buffers;
 using PcccGateway.Interface;
+using PcccGateway.Common;
 
 namespace PcccGateway.Client;
 
@@ -114,6 +115,11 @@ public class EIPTransport : ITransport
     // CancellationTokenSource used to stop the receive loop gracefully on Close().
     private CancellationTokenSource? _rxCts;
 
+    // Lifecycle token for graceful shutdown - cancels idle reads waiting for first byte.
+    // Recreated on each Open() so that reconnection works after Close().
+    private CancellationTokenSource? _lifecycleCts;
+    private CancellationToken _lifecycleToken;
+
     public event EventHandler<byte[]>? FrameReceived;
     public event EventHandler<byte[]>? RawFrameSent;
     public event EventHandler<byte[]>? RawFrameReceived;
@@ -159,6 +165,11 @@ public class EIPTransport : ITransport
         {
             _tcp = new TcpClient();
             _tcp.NoDelay = true;  // Disable Nagle algorithm
+
+            // Enable TCP Keep-Alive for passive dead-connection detection
+            // without sending application-level diagnostic frames.
+            _tcp.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+
             var connectTask = _tcp.ConnectAsync(_host, _port);
             if (!connectTask.Wait(_connectTimeoutMs))
             {
@@ -187,6 +198,13 @@ public class EIPTransport : ITransport
             _stream.WriteTimeout = _connectTimeoutMs;
             _stream.ReadTimeout  = _connectTimeoutMs;
 
+            // Create a fresh lifecycle token for this connection session.
+            // This allows Clean shutdown of idle reads and proper reconnection
+            // after Close() is called.
+            _lifecycleCts?.Dispose();
+            _lifecycleCts = new CancellationTokenSource();
+            _lifecycleToken = _lifecycleCts.Token;
+
             // RegisterSession reads/writes the stream directly and synchronously.
             // It must complete before the async receive loop starts, otherwise
             // both would compete for the same incoming bytes.
@@ -213,6 +231,14 @@ public class EIPTransport : ITransport
         {
             if (_isClosed) return;
             _isClosed = true;
+        }
+
+        // Cancel and dispose the lifecycle token to wake any idle reads.
+        if (_lifecycleCts != null)
+        {
+            try { _lifecycleCts.Cancel(); } catch { }
+            _lifecycleCts.Dispose();
+            _lifecycleCts = null;
         }
 
         // Signal the receive loop to stop before touching the stream.
@@ -583,6 +609,12 @@ public class EIPTransport : ITransport
     /// remote end.  <see cref="CloseOnConnectionLost"/> is called on exit so
     /// that resources are released even if the caller did not call
     /// <see cref="Close"/> explicitly.
+    ///
+    /// A read timeout is applied only after the header is fully received,
+    /// preventing idle connections from being disconnected every 10 seconds.
+    /// Waiting for the first byte of a new packet is done using the
+    /// <see cref="_lifecycleToken"/>, which is cancelled during shutdown
+    /// to allow graceful termination without hanging.
     /// </summary>
     private async Task ReceiveLoopAsync(CancellationToken ct)
     {
@@ -590,13 +622,26 @@ public class EIPTransport : ITransport
         byte[] header  = new byte[EipHeaderLen];
         byte[] payload = new byte[65536];
 
+        // Combined cancellation token for shutdown and per-read timeout.
+        using var timeoutCts = new CancellationTokenSource();
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
+
         while (!ct.IsCancellationRequested && IsOpen && _stream != null)
         {
             try
             {
                 // ── Read the fixed 24-byte EIP header ────────────────────────
-                int got = await ReadExactAsync(header, 0, EipHeaderLen, ct);
-                if (got < EipHeaderLen) break;  // connection closed gracefully
+                // Allow indefinite wait for the first byte of a new packet.
+                // An idle connection should stay connected indefinitely, but
+                // must respect shutdown requests via _lifecycleToken.
+                if (await ReadExactAsync(header, 0, 1, idleFirstByte: true, ct) < 1)
+                    break;  // connection closed gracefully
+
+                // Arm a partial-header timeout for the remaining bytes.
+                timeoutCts.CancelAfter(TimeSpan.FromSeconds(10));
+                if (await ReadExactAsync(header, 1, EipHeaderLen - 1, idleFirstByte: false, linkedCts.Token) < EipHeaderLen - 1)
+                    break;  // connection closed gracefully
+                timeoutCts.CancelAfter(Timeout.Infinite);
 
                 ushort cmd     = (ushort)(header[0] | (header[1] << 8));
                 ushort length  = (ushort)(header[2] | (header[3] << 8));
@@ -612,12 +657,18 @@ public class EIPTransport : ITransport
                     {
                         // Oversized packet – drain and discard to stay in sync.
                         byte[] discard = new byte[length];
-                        int drained = await ReadExactAsync(discard, 0, length, ct);
+                        // Since we are mid-message, apply a timeout to prevent hanging.
+                        timeoutCts.CancelAfter(TimeSpan.FromSeconds(10));
+                        int drained = await ReadExactAsync(discard, 0, length, idleFirstByte: false, linkedCts.Token);
+                        timeoutCts.CancelAfter(Timeout.Infinite);
                         if (drained < length) break;
                         continue;
                     }
 
-                    int payloadGot = await ReadExactAsync(payload, 0, length, ct);
+                    // Apply timeout for the payload read because the header was already received.
+                    timeoutCts.CancelAfter(TimeSpan.FromSeconds(10));
+                    int payloadGot = await ReadExactAsync(payload, 0, length, idleFirstByte: false, linkedCts.Token);
+                    timeoutCts.CancelAfter(Timeout.Infinite);
                     if (payloadGot < length) break;
                 }
 
@@ -673,9 +724,20 @@ public class EIPTransport : ITransport
                 // EIP_REGISTER_SESSION responses after initial handshake are ignored.
                 // All other command codes are silently discarded.
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
                 break;  // Close() cancelled the token
+            }
+            catch (OperationCanceledException) when (_lifecycleCts?.IsCancellationRequested == true)
+            {
+                // Shutdown requested while waiting for first byte.
+                Logger.Info(this, "Shutdown signal received during idle read – closing connection");
+                break;
+            }
+            catch (OperationCanceledException) // timeout during payload read
+            {
+                Logger.Warn(this, "EIP receive timed out while reading message payload – closing connection");
+                break;
             }
             catch
             {
@@ -706,15 +768,35 @@ public class EIPTransport : ITransport
     /// <paramref name="buffer"/> starting at <paramref name="offset"/>.
     /// Returns the number of bytes actually read; a value less than
     /// <paramref name="count"/> indicates the stream was closed.
+    ///
+    /// When <paramref name="idleFirstByte"/> is true, the first byte of the
+    /// read waits indefinitely using <see cref="_lifecycleToken"/>, which
+    /// is cancelled during shutdown to allow graceful termination. Once the
+    /// first byte arrives, the read is subject to the provided
+    /// <paramref name="transactionToken"/> timeout to prevent slow-loris attacks.
     /// </summary>
     private async Task<int> ReadExactAsync(byte[] buffer, int offset, int count,
-                                            CancellationToken ct = default)
+                                           bool idleFirstByte, CancellationToken transactionToken)
     {
         int total = 0;
         while (total < count)
         {
-            int n = await _stream!.ReadAsync(buffer, offset + total, count - total, ct);
-            if (n == 0) break;  // connection closed by remote end
+            int n;
+            if (total == 0 && idleFirstByte)
+            {
+                // Wait indefinitely for the first byte of a new frame.
+                // This keeps idle connections alive without periodic disconnects,
+                // but respects shutdown signals via the caller's cancellation token.
+                n = await _stream!.ReadAsync(buffer, offset, 1, transactionToken)
+                                  .ConfigureAwait(false);
+            }
+            else
+            {
+                // Mid-message: use the provided token (which includes the timeout).
+                n = await _stream!.ReadAsync(buffer, offset + total, count - total, transactionToken)
+                                  .ConfigureAwait(false);
+            }
+            if (n == 0) break;
             total += n;
         }
         return total;
@@ -744,6 +826,12 @@ public class EIPTransport : ITransport
     {
         if (_disposed) return;
         _disposed = true;
+        if (_lifecycleCts != null)
+        {
+            try { _lifecycleCts.Cancel(); } catch { }
+            _lifecycleCts.Dispose();
+            _lifecycleCts = null;
+        }
         Close();
     }
 }

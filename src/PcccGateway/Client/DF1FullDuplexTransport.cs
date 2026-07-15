@@ -222,13 +222,22 @@ public class DF1FullDuplexTransport : DF1BaseTransport
 
         lock (_rxLock)
         {
-            _rxBuffer.AddRange(chunk, 0, chunk.Length);
-            if (_rxBuffer.Count > MaxBufferBytes)
+            // Check capacity BEFORE adding: RingBuffer's own capacity equals
+            // MaxBufferBytes exactly, so AddRange throws InvalidOperationException
+            // the instant the combined size would exceed it — the buffer's Count
+            // can never actually be observed to exceed MaxBufferBytes afterwards.
+            // A prior version checked Count > MaxBufferBytes only after calling
+            // AddRange, which meant this safety path could never be reached; an
+            // oversized burst (e.g. line noise with no recognisable frame) would
+            // instead throw out of this method entirely, silently discarding
+            // whatever had been buffered with no recovery or log trace.
+            if (chunk.Length + _rxBuffer.Count > MaxBufferBytes)
             {
                 _rxBuffer.Clear();
                 _frameStartTime = DateTime.MinValue;
                 return;
             }
+            _rxBuffer.AddRange(chunk, 0, chunk.Length);
 
             bool consumed = true;
             while (consumed)
@@ -391,6 +400,15 @@ public class DF1FullDuplexTransport : DF1BaseTransport
         {
             OnFrameReceived(pduToDeliver);
         }
+    }
+
+    /// <inheritdoc/>
+    public override void Open()
+    {
+        _closing = false;
+        _ackNakEvent.Reset();
+        _enqEvent.Reset();
+        base.Open();
     }
 
     /// <inheritdoc/>

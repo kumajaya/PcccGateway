@@ -33,8 +33,37 @@ public static class Logger
 {
     private static volatile bool _enabled = true;
     public static bool ShowTimestamp { get; set; } = true;
-    private static readonly object _lock = new object();
+
+    private const int LogQueueCapacity = 1024;
+    private static int _droppedMessages;
+    private static readonly BlockingCollection<string> _logQueue = new(new ConcurrentQueue<string>(), LogQueueCapacity);
     private static readonly ConcurrentDictionary<Type, string> _categoryCache = new();
+    private static readonly Task _writerTask;
+    private static volatile bool _shutdown;
+
+    static Logger()
+    {
+        // Start a dedicated background thread to write logs.
+        _writerTask = Task.Factory.StartNew(() =>
+        {
+            foreach (var message in _logQueue.GetConsumingEnumerable())
+            {
+                try
+                {
+                    Console.WriteLine(message);
+                }
+                catch (IOException)
+                {
+                    // Ignore transient console write failures and continue consuming.
+                }
+                catch (ObjectDisposedException)
+                {
+                    // Console output has been disposed; stop processing cleanly.
+                    break;
+                }
+            }
+        }, TaskCreationOptions.LongRunning);
+    }
 
     public static bool Enabled
     {
@@ -51,12 +80,41 @@ public static class Logger
         }
     }
 
-    private static void WriteLine(string prefix, string message)
+    public static int DroppedMessages => Volatile.Read(ref _droppedMessages);
+
+    private static void EnqueueLog(string line, bool force = false)
     {
-        if (ShowTimestamp)
-            Console.WriteLine($"{prefix} {DateTime.Now:HH:mm:ss.fff} {message}");
-        else
-            Console.WriteLine($"{prefix} {message}");
+        if (_shutdown) return;
+
+        try
+        {
+            if (force)
+            {
+                if (!_logQueue.TryAdd(line, millisecondsTimeout: 100))
+                    Interlocked.Increment(ref _droppedMessages);
+            }
+            else if (!_logQueue.TryAdd(line))
+            {
+                Interlocked.Increment(ref _droppedMessages);
+            }
+        }
+        catch (ObjectDisposedException)
+        {
+            // queue closed or disposed, ignore
+        }
+        catch (InvalidOperationException)
+        {
+            // queue is closed; ignore remaining logs during shutdown.
+        }
+    }
+
+    private static void WriteLine(string prefix, string message, bool force = false)
+    {
+        if (!_enabled && !force) return;
+        string formatted = ShowTimestamp
+            ? $"{prefix} {DateTime.Now:HH:mm:ss.fff} {message}"
+            : $"{prefix} {message}";
+        EnqueueLog(formatted, force);
     }
 
     private static string GetCategory(object? sender)
@@ -83,8 +141,7 @@ public static class Logger
     public static void Info(object? sender, string message)
     {
         if (!Enabled) return;
-        lock (_lock)
-            WriteLine($"[{GetCategory(sender)}]", message);
+        WriteLine($"[{GetCategory(sender)}]", message);
     }
 
     /// <summary>Hex dump if Logger.Enabled == true.</summary>
@@ -92,29 +149,26 @@ public static class Logger
     {
         if (!Enabled || length <= 0 || data == null) return;
         if (length > data.Length) length = data.Length;
-        lock (_lock)
-        {
-            if (ShowTimestamp)
-                Console.Write($"[{GetCategory(sender)}] {DateTime.Now:HH:mm:ss.fff} {prefix} ");
-            else
-                Console.Write($"[{GetCategory(sender)}] {prefix} ");
-            WriteHex(Console.Out, data, length);
-            Console.WriteLine();
-        }
+        // Build the full log line in memory and enqueue as a single item.
+        string category = GetCategory(sender);
+        string timestamp = ShowTimestamp ? $"{DateTime.Now:HH:mm:ss.fff} " : "";
+        using var sw = new StringWriter();
+        sw.Write($"[{category}] {timestamp}{prefix} ");
+        WriteHex(sw, data, length);
+        string line = sw.ToString();
+        EnqueueLog(line);
     }
 
     /// <summary>Always log (ignores Logger.Enabled).</summary>
     public static void Always(object? sender, string message)
     {
-        lock (_lock)
-            WriteLine($"[{GetCategory(sender)}]", message);
+        WriteLine($"[{GetCategory(sender)}]", message, force: true);
     }
 
     /// <summary>Warn log (ignores Logger.Enabled).</summary>
     public static void Warn(object? sender, string message)
     {
-        lock (_lock)
-            WriteLine($"[{GetCategory(sender)}]", "[WARN] " + message);
+        WriteLine($"[{GetCategory(sender)}]", "[WARN] " + message, force: true);
     }
 
     /// <summary>Always hex dump (ignores Logger.Enabled).</summary>
@@ -122,14 +176,28 @@ public static class Logger
     {
         if (length <= 0 || data == null) return;
         if (length > data.Length) length = data.Length;
-        lock (_lock)
+        string category = GetCategory(sender);
+        string timestamp = ShowTimestamp ? $"{DateTime.Now:HH:mm:ss.fff} " : "";
+        using var sw = new StringWriter();
+        sw.Write($"[{category}] {timestamp}{prefix} ");
+        WriteHex(sw, data, length);
+        string line = sw.ToString();
+        EnqueueLog(line, force: true);
+    }
+
+    /// <summary>
+    /// Completes the logging queue and waits for the writer task to drain.
+    /// </summary>
+    public static void Shutdown(int timeoutMs = 5000)
+    {
+        if (_shutdown) return;
+        _shutdown = true;
+        _logQueue.CompleteAdding();
+        try
         {
-            if (ShowTimestamp)
-                Console.Write($"[{GetCategory(sender)}] {DateTime.Now:HH:mm:ss.fff} {prefix} ");
-            else
-                Console.Write($"[{GetCategory(sender)}] {prefix} ");
-            WriteHex(Console.Out, data, length);
-            Console.WriteLine();
+            if (!_writerTask.IsCompleted)
+                _writerTask.Wait(timeoutMs);
         }
+        catch { /* swallow shutdown failures */ }
     }
 }

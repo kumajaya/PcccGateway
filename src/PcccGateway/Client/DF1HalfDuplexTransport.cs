@@ -167,12 +167,15 @@ public class DF1HalfDuplexTransport : DF1BaseTransport
     private volatile bool _responseDataReceived;
     private volatile byte[]? _responseDataFrame;
 
-    // Set by Close()/Dispose() so the polling wait loops (WaitForCommandAck,
-    // PollForResponse) and the SendFrame retry loop exit promptly on shutdown instead of
-    // running out their full timeouts against an unresponsive slave. Unlike the full-duplex
-    // transport this class waits by polling flags with Thread.Sleep rather than on an event,
-    // so shutdown is handled by checking this flag in the loop conditions, not by signalling.
+    // Set by Close()/Dispose() so the polling wait loops exit promptly on shutdown.
     private volatile bool _closing;
+
+    // --- Event-based waiting (replaces tight polling) ---
+    // Used to wake the sending thread when an ACK/NAK or data frame arrives.
+    private readonly ManualResetEventSlim _stateEvent = new ManualResetEventSlim(false);
+    private readonly ManualResetEventSlim _shutdownEvent = new ManualResetEventSlim(false);
+    private int _activeOperations;
+    private volatile bool _disposing;
 
     /// <summary>
     /// Initialises the half‑duplex master transport with a custom <see cref="ISerialPort"/>.
@@ -196,6 +199,8 @@ public class DF1HalfDuplexTransport : DF1BaseTransport
     /// <inheritdoc/>
     public override void Open()
     {
+        _closing = false;
+        _shutdownEvent.Reset();
         base.Open();
         // Set initial RTS/DTR state to receive mode
         if (_rs485Mode != Rs485ControlMode.Auto)
@@ -223,6 +228,8 @@ public class DF1HalfDuplexTransport : DF1BaseTransport
 
         lock (_txLock)   // Only one transaction at a time
         {
+            if (_closing)
+                throw new InvalidOperationException("Transport is closing.");
             // On a half-duplex multidrop link the slave polls on its node
             // address and expects that same address as the command frame's DST
             // byte. Callers (e.g. the gateway) build the PDU with a generic
@@ -237,38 +244,54 @@ public class DF1HalfDuplexTransport : DF1BaseTransport
             bool commandAcknowledged = false;
 
             // Step 1 & 2: Send command frame, retry on NAK or timeout up to 3 times (spec §6.3)
-            for (int attempt = 0; attempt < maxCmdRetries; attempt++)
+            if (!TryBeginActiveOperation())
+                throw new InvalidOperationException("Transport is closing.");
+            try
             {
-                ResetTransactionFlags();
-                _currentState = MasterState.WaitingForCommandAck;
-                SendDataFrame(commandFrame);
-
-                if (WaitForCommandAck(out bool wasNak))
+                for (int attempt = 0; attempt < maxCmdRetries; attempt++)
                 {
-                    commandAcknowledged = true;
-                    break;
-                }
+                    ResetTransactionFlags();
+                    lock (_stateLock)
+                    {
+                        _currentState = MasterState.WaitingForCommandAck;
+                        _stateEvent.Reset();
+                    }
+                    SendDataFrame(commandFrame);
 
-                // Shutdown requested: stop retrying and surface as a send failure rather
-                // than exhausting all attempts and their backoff delays.
-                if (_closing)
-                {
-                    _currentState = MasterState.Idle;
-                    throw new TimeoutException("Send aborted: transport is closing.");
-                }
+                    if (WaitForCommandAck(out bool wasNak))
+                    {
+                        commandAcknowledged = true;
+                        // Reset backoff after successful ACK to prevent latency creep.
+                        SleepDelay = 0;
+                        break;
+                    }
 
-                // If this was the last attempt, throw timeout exception
-                if (attempt == maxCmdRetries - 1)
-                {
-                    _currentState = MasterState.Idle;
-                    throw new TimeoutException(
-                        $"Slave did not respond to command frame after {maxCmdRetries} attempts.");
-                }
+                    // Shutdown requested: stop retrying and surface as a send failure rather
+                    // than exhausting all attempts and their backoff delays.
+                    if (_closing)
+                    {
+                        _currentState = MasterState.Idle;
+                        throw new TimeoutException("Send aborted: transport is closing.");
+                    }
 
-                // Backoff: increase delay if NAK, otherwise use current SleepDelay
-                if (wasNak && SleepDelay < 400)
-                    SleepDelay += 50;
-                Thread.Sleep(SleepDelay > 0 ? SleepDelay : 20);
+                    // If this was the last attempt, throw timeout exception
+                    if (attempt == maxCmdRetries - 1)
+                    {
+                        _currentState = MasterState.Idle;
+                        throw new TimeoutException(
+                            $"Slave did not respond to command frame after {maxCmdRetries} attempts.");
+                    }
+
+                    // Backoff: increase delay if NAK, otherwise use current SleepDelay
+                    if (wasNak && SleepDelay < 400)
+                        SleepDelay += 50;
+                    if (WaitForShutdownOrDelay(SleepDelay > 0 ? SleepDelay : 20))
+                        _closing = true;
+                }
+            }
+            finally
+            {
+                EndActiveOperation();
             }
 
             if (!commandAcknowledged)
@@ -306,62 +329,109 @@ public class DF1HalfDuplexTransport : DF1BaseTransport
         _responseDataFrame = null;
     }
 
+    private bool TryBeginActiveOperation()
+    {
+        lock (_stateLock)
+        {
+            if (_closing || _disposing)
+                return false;
+            _activeOperations++;
+            return true;
+        }
+    }
+
+    private bool WaitForShutdownOrDelay(int milliseconds)
+    {
+        if (milliseconds <= 0)
+            milliseconds = 20;
+        return _shutdownEvent.Wait(milliseconds) || _closing || _disposing;
+    }
+
+    private void EndActiveOperation()
+    {
+        lock (_stateLock)
+        {
+            if (--_activeOperations == 0)
+                Monitor.PulseAll(_stateLock);
+        }
+    }
+
+    /// <summary>
+    /// Waits for the slave to respond with ACK or NAK after sending a command frame.
+    /// Uses ManualResetEventSlim to avoid tight polling and reduce CPU usage.
+    /// </summary>
     private bool WaitForCommandAck(out bool wasNak)
     {
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        while (sw.ElapsedMilliseconds < CommandAckTimeoutMs)
+        // Wait for the event to be set by the receive thread, or timeout.
+        bool signaled = _stateEvent.Wait(CommandAckTimeoutMs);
+
+        if (_closing || !signaled)
         {
-            if (_closing) { wasNak = false; return false; }   // shutdown: stop waiting
-            if (_commandAckReceived) { wasNak = false; return true; }
-            if (_commandNakReceived) { wasNak = true; return false; }
-            Thread.Sleep(1);
+            wasNak = false;
+            return false;
         }
+
+        if (_commandAckReceived) { wasNak = false; return true; }
+        if (_commandNakReceived) { wasNak = true; return false; }
+
         wasNak = false;
         return false;
     }
 
+    /// <summary>
+    /// Polls the slave for a response by sending DLE ENQ + SlaveAddress repeatedly.
+    /// Uses ManualResetEventSlim to avoid tight polling and reduce CPU usage.
+    /// </summary>
     private byte[]? PollForResponse()
     {
-        for (int attempt = 0; attempt < MaxPollAttempts; attempt++)
+        if (!TryBeginActiveOperation()) return null;
+        try
         {
-            if (_closing) return null;   // shutdown: stop polling
-
-            _pollNakReceived = false;
-            _responseDataReceived = false;
-            _responseDataFrame = null;
-
-            SendPoll();
-
-            // Wait for either NAK or data frame (inline, no lambda allocation)
-            var sw = System.Diagnostics.Stopwatch.StartNew();
-            while (!_pollNakReceived && !_responseDataReceived)
+            for (int attempt = 0; attempt < MaxPollAttempts; attempt++)
             {
-                if (_closing) return null;   // shutdown: abandon the wait
-                if (sw.ElapsedMilliseconds >= PollResponseTimeoutMs)
-                    break;
-                Thread.Sleep(1);
-            }
+                if (_closing) return null;
 
-            if (_responseDataReceived && _responseDataFrame != null)
-            {
-                // Step 5: Final ACK must go through direction control
-                SendWithDirectionControl(new byte[] { DLE, ACK });
-                OnRawFrameSent(new byte[] { DLE, ACK });
-                return _responseDataFrame;
-            }
+                _pollNakReceived = false;
+                _responseDataReceived = false;
+                _responseDataFrame = null;
 
-            if (_pollNakReceived)
-            {
-                // Slave not ready – wait and continue polling
-                if (PollRetryDelayMs > 0)
-                    Thread.Sleep(PollRetryDelayMs);
-                continue;
-            }
+                lock (_stateLock)
+                {
+                    _stateEvent.Reset();
+                }
+                SendPoll();
 
-            // Timeout – no response to poll
-            break;
+                // Wait for either NAK or data frame using the event.
+                bool signaled = _stateEvent.Wait(PollResponseTimeoutMs);
+
+                if (_closing) return null;
+                if (!signaled) break; // timeout
+
+                if (_responseDataReceived && _responseDataFrame != null)
+                {
+                    // Step 5: Final ACK must go through direction control
+                    SendWithDirectionControl(new byte[] { DLE, ACK });
+                    OnRawFrameSent(new byte[] { DLE, ACK });
+                    return _responseDataFrame;
+                }
+
+                if (_pollNakReceived)
+                {
+                    // Slave not ready – wait and continue polling
+                    if (PollRetryDelayMs > 0 && WaitForShutdownOrDelay(PollRetryDelayMs))
+                        return null;
+                    continue;
+                }
+
+                // Timeout – no response to poll
+                break;
+            }
+            return null;
         }
-        return null;
+        finally
+        {
+            EndActiveOperation();
+        }
     }
 
     // --- Transmission Methods (using direction control + echo suppression) ---
@@ -432,189 +502,223 @@ public class DF1HalfDuplexTransport : DF1BaseTransport
     // --- Receive Handler (State Machine + Echo Suppression) ---
     private void OnBytesReceived(object? sender, byte[] chunk)
     {
-        // Apply echo suppression if enabled
-        byte[] filtered = chunk;
-        if (EchoSuppression && _suppressEcho && _echoSuppressBytes > 0)
+        if (!TryBeginActiveOperation()) return;
+        try
         {
-            int discard = Math.Min(chunk.Length, _echoSuppressBytes);
-            int remaining = Interlocked.Add(ref _echoSuppressBytes, -discard);
-            if (remaining <= 0)
-                _suppressEcho = false;
-            if (discard >= chunk.Length)
-                return; // entire chunk was echo, ignore
-            int newLen = chunk.Length - discard;
-            filtered = new byte[newLen];
-            Array.Copy(chunk, discard, filtered, 0, newLen);
-        }
-
-        lock (_rxLock)
-        {
-            _rxBuffer.AddRange(filtered, 0, filtered.Length);
-            if (_rxBuffer.Count > MaxBufferBytes)
+            // Apply echo suppression if enabled
+            byte[] filtered = chunk;
+            if (EchoSuppression && _suppressEcho && _echoSuppressBytes > 0)
             {
-                _rxBuffer.Clear();
-                _frameStartTime = DateTime.MinValue;
-                return;
+                int discard = Math.Min(chunk.Length, _echoSuppressBytes);
+                int remaining = Interlocked.Add(ref _echoSuppressBytes, -discard);
+                if (remaining <= 0)
+                    _suppressEcho = false;
+                if (discard >= chunk.Length)
+                    return; // entire chunk was echo, ignore
+                int newLen = chunk.Length - discard;
+                filtered = new byte[newLen];
+                Array.Copy(chunk, discard, filtered, 0, newLen);
             }
 
-            bool consumed = true;
-            while (consumed && _rxBuffer.Count >= 2)
+            lock (_rxLock)
             {
-                consumed = false;
-
-                // Synchronisation: find DLE
-                if (_rxBuffer[0] != DLE)
+                // Check capacity BEFORE adding — see DF1FullDuplexTransport.OnBytesReceived
+                // for why checking Count > MaxBufferBytes only after AddRange never actually
+                // triggers: RingBuffer's capacity equals MaxBufferBytes exactly, so AddRange
+                // itself throws InvalidOperationException the instant it would be exceeded.
+                if (filtered.Length + _rxBuffer.Count > MaxBufferBytes)
                 {
-                    _rxBuffer.Advance(1);
-                    consumed = true;
-                    continue;
-                }
-
-                byte ctrl = _rxBuffer[1];
-
-                // --- ACK / NAK processing (with explicit state) ---
-                if (ctrl == ACK || ctrl == NAK)
-                {
-                    _rxBuffer.Advance(2);
+                    _rxBuffer.Clear();
                     _frameStartTime = DateTime.MinValue;
-
-                    lock (_stateLock)
-                    {
-                        if (_currentState == MasterState.WaitingForCommandAck)
-                        {
-                            if (ctrl == ACK)
-                                _commandAckReceived = true;
-                            else if (ctrl == NAK)
-                                _commandNakReceived = true;
-                        }
-                        else if (_currentState == MasterState.WaitingForPollResponse && ctrl == NAK)
-                        {
-                            _pollNakReceived = true;
-                        }
-                        // ACK during polling is ignored (should not happen)
-                    }
-                    consumed = true;
-                    continue;
+                    return;
                 }
+                _rxBuffer.AddRange(filtered, 0, filtered.Length);
 
-                // --- Data frame: DLE STX ... DLE ETX ---
-                if (ctrl == STX)
+                bool consumed = true;
+                while (consumed && _rxBuffer.Count >= 2)
                 {
-                    if (_frameStartTime == DateTime.MinValue)
-                        _frameStartTime = DateTime.UtcNow;
+                    consumed = false;
 
-                    if ((DateTime.UtcNow - _frameStartTime).TotalMilliseconds > FrameTimeoutMs)
+                    // Synchronisation: find DLE
+                    if (_rxBuffer[0] != DLE)
                     {
-                        _rxBuffer.Advance(2);
-                        _frameStartTime = DateTime.MinValue;
+                        _rxBuffer.Advance(1);
                         consumed = true;
                         continue;
                     }
 
-                    // Find DLE ETX, skipping over stuffed DLE pairs
-                    int etxIndex = -1;
-                    for (int i = 2; i < _rxBuffer.Count - 1; i++)
-                    {
-                        if (_rxBuffer[i] == DLE)
-                        {
-                            if (_rxBuffer[i + 1] == DLE)
-                            {
-                                i++; // skip the stuffed pair
-                                continue;
-                            }
-                            if (_rxBuffer[i + 1] == ETX)
-                            {
-                                etxIndex = i;
-                                break;
-                            }
-                        }
-                    }
-                    if (etxIndex == -1)
-                        break; // need more bytes
+                    byte ctrl = _rxBuffer[1];
 
-                    int csLen = (ChecksumType == CheckSumOptions.Crc) ? 2 : 1;
-                    int totalLen = etxIndex + 2 + csLen;
-                    if (_rxBuffer.Count < totalLen)
-                        break; // checksum bytes not yet received
-
-                    // Extract the complete frame using ArrayPool
-                    byte[] rawFrame = System.Buffers.ArrayPool<byte>.Shared.Rent(totalLen);
-                    try
+                    // --- ACK / NAK processing (with explicit state) ---
+                    if (ctrl == ACK || ctrl == NAK)
                     {
-                        Array.Clear(rawFrame, 0, totalLen);
-                        _rxBuffer.Peek(rawFrame, 0, totalLen);
-                        // Copy for event (cannot pass rented buffer out)
-                        byte[] rawFrameCopy = new byte[totalLen];
-                        Array.Copy(rawFrame, 0, rawFrameCopy, 0, totalLen);
-                        OnRawFrameReceived(rawFrameCopy);
-                        _rxBuffer.Advance(totalLen);
+                        _rxBuffer.Advance(2);
                         _frameStartTime = DateTime.MinValue;
 
-                        // Extract inner frame (unstuffed)
-                        int payloadLen = etxIndex - 2;
-                        byte[] stuffed = new byte[payloadLen];
-                        Array.Copy(rawFrame, 2, stuffed, 0, payloadLen);
-                        byte[] innerFrame = RemoveDleStuffing(stuffed);
-
-                        // Validate checksum
-                        bool valid;
-                        if (ChecksumType == CheckSumOptions.Crc)
+                        lock (_stateLock)
                         {
-                            ushort calc = CalculateChecksum(innerFrame, CheckSumOptions.Crc);
-                            ushort recv = (ushort)(rawFrame[etxIndex + 2] | (rawFrame[etxIndex + 3] << 8));
-                            valid = calc == recv;
-                        }
-                        else
-                        {
-                            byte calc = (byte)CalculateChecksum(innerFrame, CheckSumOptions.Bcc);
-                            byte recv = rawFrame[etxIndex + 2];
-                            valid = calc == recv;
-                        }
-
-                        if (valid)
-                        {
-                            lock (_stateLock)
+                            if (_currentState == MasterState.WaitingForCommandAck)
                             {
-                                if (_currentState == MasterState.WaitingForPollResponse)
+                                if (ctrl == ACK)
+                                    _commandAckReceived = true;
+                                else if (ctrl == NAK)
+                                    _commandNakReceived = true;
+                                // Wake the waiting thread (WaitForCommandAck)
+                                _stateEvent.Set();
+                            }
+                            else if (_currentState == MasterState.WaitingForPollResponse && ctrl == NAK)
+                            {
+                                _pollNakReceived = true;
+                                // Wake the waiting thread (PollForResponse)
+                                _stateEvent.Set();
+                            }
+                            // ACK during polling is ignored (should not happen)
+                        }
+                        consumed = true;
+                        continue;
+                    }
+
+                    // --- Data frame: DLE STX ... DLE ETX ---
+                    if (ctrl == STX)
+                    {
+                        if (_frameStartTime == DateTime.MinValue)
+                            _frameStartTime = DateTime.UtcNow;
+
+                        if ((DateTime.UtcNow - _frameStartTime).TotalMilliseconds > FrameTimeoutMs)
+                        {
+                            _rxBuffer.Advance(2);
+                            _frameStartTime = DateTime.MinValue;
+                            consumed = true;
+                            continue;
+                        }
+
+                        // Find DLE ETX, skipping over stuffed DLE pairs
+                        int etxIndex = -1;
+                        for (int i = 2; i < _rxBuffer.Count - 1; i++)
+                        {
+                            if (_rxBuffer[i] == DLE)
+                            {
+                                if (_rxBuffer[i + 1] == DLE)
                                 {
-                                    _responseDataReceived = true;
-                                    _responseDataFrame = innerFrame;
+                                    i++; // skip the stuffed pair
+                                    continue;
+                                }
+                                if (_rxBuffer[i + 1] == ETX)
+                                {
+                                    etxIndex = i;
+                                    break;
                                 }
                             }
                         }
-                        // Invalid frame – ignore (master will timeout)
-                    }
-                    finally
-                    {
-                        System.Buffers.ArrayPool<byte>.Shared.Return(rawFrame);
-                    }
-                    consumed = true;
-                    continue;
-                }
+                        if (etxIndex == -1)
+                            break; // need more bytes
 
-                // Unexpected byte after DLE – discard DLE
-                _rxBuffer.Advance(1);
-                consumed = true;
+                        int csLen = (ChecksumType == CheckSumOptions.Crc) ? 2 : 1;
+                        int totalLen = etxIndex + 2 + csLen;
+                        if (_rxBuffer.Count < totalLen)
+                            break; // checksum bytes not yet received
+
+                        // Extract the complete frame using ArrayPool
+                        byte[] rawFrame = System.Buffers.ArrayPool<byte>.Shared.Rent(totalLen);
+                        try
+                        {
+                            Array.Clear(rawFrame, 0, totalLen);
+                            _rxBuffer.Peek(rawFrame, 0, totalLen);
+                            // Copy for event (cannot pass rented buffer out)
+                            byte[] rawFrameCopy = new byte[totalLen];
+                            Array.Copy(rawFrame, 0, rawFrameCopy, 0, totalLen);
+                            OnRawFrameReceived(rawFrameCopy);
+                            _rxBuffer.Advance(totalLen);
+                            _frameStartTime = DateTime.MinValue;
+
+                            // Extract inner frame (unstuffed)
+                            int payloadLen = etxIndex - 2;
+                            byte[] stuffed = new byte[payloadLen];
+                            Array.Copy(rawFrame, 2, stuffed, 0, payloadLen);
+                            byte[] innerFrame = RemoveDleStuffing(stuffed);
+
+                            // Validate checksum
+                            bool valid;
+                            if (ChecksumType == CheckSumOptions.Crc)
+                            {
+                                ushort calc = CalculateChecksum(innerFrame, CheckSumOptions.Crc);
+                                ushort recv = (ushort)(rawFrame[etxIndex + 2] | (rawFrame[etxIndex + 3] << 8));
+                                valid = calc == recv;
+                            }
+                            else
+                            {
+                                byte calc = (byte)CalculateChecksum(innerFrame, CheckSumOptions.Bcc);
+                                byte recv = rawFrame[etxIndex + 2];
+                                valid = calc == recv;
+                            }
+
+                            if (valid)
+                            {
+                                lock (_stateLock)
+                                {
+                                    if (_currentState == MasterState.WaitingForPollResponse)
+                                    {
+                                        _responseDataReceived = true;
+                                        _responseDataFrame = innerFrame;
+                                        // Wake the waiting thread (PollForResponse)
+                                        _stateEvent.Set();
+                                    }
+                                }
+                            }
+                            // Invalid frame – ignore (master will timeout)
+                        }
+                        finally
+                        {
+                            System.Buffers.ArrayPool<byte>.Shared.Return(rawFrame);
+                        }
+                        consumed = true;
+                        continue;
+                    }
+
+                    // Unexpected byte after DLE – discard DLE
+                    _rxBuffer.Advance(1);
+                    consumed = true;
+                }
             }
+        }
+        finally
+        {
+            EndActiveOperation();
         }
     }
 
     /// <inheritdoc/>
     public override void Close()
     {
-        // Signal shutdown so the polling wait loops (WaitForCommandAck/PollForResponse) and
-        // the SendFrame retry loop exit at their next flag check instead of running out the
-        // remaining timeout against an unresponsive slave. CloseComms() calls Close() before
-        // Dispose(). No event to signal here — the loops poll _closing directly.
-        _closing = true;
+        lock (_stateLock)
+        {
+            if (_closing) return;
+            _closing = true;
+            _shutdownEvent.Set();
+            try { _stateEvent.Set(); } catch { }
+            while (_activeOperations > 0)
+                Monitor.Wait(_stateLock);
+        }
+
         base.Close();
     }
 
     /// <inheritdoc/>
     public override void Dispose()
     {
-        _closing = true;
+        lock (_stateLock)
+        {
+            _disposing = true;
+            _closing = true;
+            _shutdownEvent.Set();
+            try { _stateEvent.Set(); } catch { }
+            while (_activeOperations > 0)
+                Monitor.Wait(_stateLock);
+        }
+
         _port.BytesReceived -= OnBytesReceived;
+        _stateEvent.Dispose();
+        _shutdownEvent.Dispose();
         base.Dispose();
     }
 }

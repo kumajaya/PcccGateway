@@ -17,6 +17,7 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 using System.IO.Ports;
+using System.Threading.Channels;
 using PcccGateway.Interface;
 
 namespace PcccGateway.Client;
@@ -28,6 +29,19 @@ public class SerialPortWrapper : ISerialPort
 {
     private readonly SerialPort _port;
     private readonly object _sync = new object();
+
+    // Received chunks are handed off through this channel instead of being dispatched
+    // straight from the SerialPort driver's own callback thread. Reading synchronously
+    // there risks a deadlock if a handler calls back into the port (e.g. Close()) from
+    // the same thread the driver uses to raise DataReceived. A single dedicated consumer
+    // task drains the channel and invokes BytesReceived in the exact order chunks arrived
+    // — unlike the previous ThreadPool.QueueUserWorkItem-per-chunk approach, where the
+    // pool's own scheduling gave no guarantee that two work items would run in the order
+    // they were queued, letting a later chunk of the same DF1/CSP stream reach the
+    // consumer before an earlier one and corrupt frame reassembly.
+    private readonly Channel<byte[]> _rxChannel = Channel.CreateUnbounded<byte[]>(
+        new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
+    private readonly Task _rxDispatchTask;
 
     public event EventHandler<byte[]>? BytesReceived;
 
@@ -43,6 +57,7 @@ public class SerialPortWrapper : ISerialPort
             WriteTimeout = 2000
         };
         _port.DataReceived += Port_DataReceived;
+        _rxDispatchTask = Task.Run(DispatchLoopAsync);
     }
 
     private void Port_DataReceived(object sender, SerialDataReceivedEventArgs e)
@@ -61,23 +76,43 @@ public class SerialPortWrapper : ISerialPort
                 byte[] actualData = new byte[read];
                 Buffer.BlockCopy(buffer, 0, actualData, 0, read);
 
-                // Offload event to thread pool to avoid deadlock on Close()
-                ThreadPool.QueueUserWorkItem(_ =>
-                {
-                    try
-                    {
-                        BytesReceived?.Invoke(this, actualData);
-                    }
-                    catch
-                    {
-                        // Ignore exceptions in event handlers (upper layer handles)
-                    }
-                });
+                // TryWrite on an unbounded channel never blocks and never fails
+                // (short of the channel already being completed at shutdown), so this
+                // returns immediately — the driver's callback thread is not held up
+                // waiting for the handler to run.
+                _rxChannel.Writer.TryWrite(actualData);
             }
         }
         catch
         {
             // Ignore serial port read errors; upper layer will timeout
+        }
+    }
+
+    /// <summary>
+    /// Drains <see cref="_rxChannel"/> on a single dedicated task, invoking
+    /// <see cref="BytesReceived"/> for each chunk strictly in arrival order.
+    /// Runs until <see cref="Dispose"/> completes the channel writer.
+    /// </summary>
+    private async Task DispatchLoopAsync()
+    {
+        try
+        {
+            await foreach (var chunk in _rxChannel.Reader.ReadAllAsync().ConfigureAwait(false))
+            {
+                try
+                {
+                    BytesReceived?.Invoke(this, chunk);
+                }
+                catch
+                {
+                    // Ignore exceptions in event handlers (upper layer handles)
+                }
+            }
+        }
+        catch (ChannelClosedException)
+        {
+            // Normal shutdown path.
         }
     }
 
@@ -132,6 +167,16 @@ public class SerialPortWrapper : ISerialPort
             _port.DataReceived -= Port_DataReceived;
             Close();
             _port.Dispose();
+        }
+        catch { }
+
+        // Signal the dispatch loop to exit once it has drained whatever was already
+        // queued, then wait briefly for it to finish so BytesReceived is never invoked
+        // after Dispose() returns. Bounded wait: a stuck subscriber must not hang shutdown.
+        try
+        {
+            _rxChannel.Writer.TryComplete();
+            _rxDispatchTask.Wait(2000);
         }
         catch { }
     }
