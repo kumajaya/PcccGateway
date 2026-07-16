@@ -114,6 +114,7 @@ public class EIPTransport : ITransport
 
     // CancellationTokenSource used to stop the receive loop gracefully on Close().
     private CancellationTokenSource? _rxCts;
+    private Task? _rxTask;
 
     // Lifecycle token for graceful shutdown - cancels idle reads waiting for first byte.
     // Recreated on each Open() so that reconnection works after Close().
@@ -212,7 +213,7 @@ public class EIPTransport : ITransport
 
             // Start the background receive loop after the session is established.
             _rxCts = new CancellationTokenSource();
-            _ = Task.Run(() => ReceiveLoopAsync(_rxCts.Token));
+            _rxTask = Task.Run(() => ReceiveLoopAsync(_rxCts.Token));
         }
         catch (Exception ex)
         {
@@ -258,6 +259,13 @@ public class EIPTransport : ITransport
         }
         catch { }
 
+        if (_rxTask != null && !_rxTask.IsCompleted && Task.CurrentId != _rxTask.Id)
+        {
+            _rxTask.Wait(1000);
+        }
+
+        _rxTask?.Dispose();
+        _rxTask = null;
         _rxCts?.Dispose();
         _rxCts         = null;
         _stream        = null;

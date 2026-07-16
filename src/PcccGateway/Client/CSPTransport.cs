@@ -153,6 +153,7 @@ public class CSPTransport : ITransport
     private bool _isClosed = false;
 
     private CancellationTokenSource? _rxCts;
+    private Task? _rxTask;
 
     // Lifecycle token for graceful shutdown - cancels idle reads waiting for first byte.
     // Recreated on each Open() so that reconnection works after Close().
@@ -240,7 +241,7 @@ public class CSPTransport : ITransport
             RegisterSession();
 
             _rxCts = new CancellationTokenSource();
-            _ = Task.Run(() => ReceiveLoopAsync(_rxCts.Token));
+            _rxTask = Task.Run(() => ReceiveLoopAsync(_rxCts.Token));
         }
         catch (Exception ex)
         {
@@ -278,6 +279,13 @@ public class CSPTransport : ITransport
         }
         catch { }
 
+        if (_rxTask != null && !_rxTask.IsCompleted && Task.CurrentId != _rxTask.Id)
+        {
+            _rxTask.Wait(1000);
+        }
+
+        _rxTask?.Dispose();
+        _rxTask = null;
         _rxCts?.Dispose();
         _rxCts        = null;
         _stream       = null;

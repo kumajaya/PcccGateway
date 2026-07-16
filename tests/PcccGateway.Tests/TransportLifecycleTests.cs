@@ -140,12 +140,6 @@ public class TransportLifecycleTests
             transport.Close();
             Assert.False(transport.IsOpen);
 
-            // Allow the background receive loop from the previous connection to
-            // fully exit before opening a new one. This prevents ObjectDisposedException
-            // when the new connection attempts to create a fresh NetworkStream while
-            // the old one is still being torn down.
-            await Task.Delay(50);
-
             transport.Open();
             Assert.True(transport.IsOpen);
         }
