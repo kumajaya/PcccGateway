@@ -582,5 +582,6 @@ public class Gateway : IDisposable
         // 2 s for the supervisor to exit, so disposing here could race a still-live
         // thread into an ObjectDisposedException. As a process-lifetime singleton,
         // leaving the lightweight event to finalization is the race-free choice.
+        GC.SuppressFinalize(this);
     }
 }

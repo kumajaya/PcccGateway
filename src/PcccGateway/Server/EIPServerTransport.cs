@@ -70,6 +70,14 @@ namespace PcccGateway.Server;
 /// </summary>
 public partial class EIPServerTransport : IServerTransport, IDisposable
 {
+    // ── EIP Encapsulation constants ──────────────────────────────────────────
+    // These constants eliminate magic numbers throughout the EIP server code.
+    private const int EIP_HEADER_LEN = 24;
+    private const int CPF_PREFIX_LEN = 8;      // Interface Handle(4) + Timeout(2) + ItemCount(2)
+    private const int NULL_ADDR_ITEM_LEN = 4;   // type(2) + length(2)
+    private const int UCD_ITEM_HEADER_LEN = 4;  // type(2) + length(2)
+    private const int CIP_PAYLOAD_OFFSET = EIP_HEADER_LEN + CPF_PREFIX_LEN + NULL_ADDR_ITEM_LEN + UCD_ITEM_HEADER_LEN; // 40
+
     // ── External dependencies ────────────────────────────────────────────────
 
     private readonly int _port;
@@ -270,7 +278,7 @@ public partial class EIPServerTransport : IServerTransport, IDisposable
         }
         finally
         {
-            // The health monitor is activated when logging disabled 
+            // The health monitor is activated when logging disabled
             SetHealthStatsEnabled(!Logger.Enabled);
 
             // Cache local IP address once at startup (avoid repeated enumeration)
@@ -278,7 +286,7 @@ public partial class EIPServerTransport : IServerTransport, IDisposable
             if (_cachedLocalAddress == null)
                 Logger.Info(this, "No valid IPv4 unicast address found for ListIdentity");
 
-            Logger.Info(this, $"EtherNet/IP transport started on TCP/UDP port {_port}");            
+            Logger.Info(this, $"EtherNet/IP transport started on TCP/UDP port {_port}");
         }
     }
 
@@ -486,7 +494,7 @@ public partial class EIPServerTransport : IServerTransport, IDisposable
     {
         int errorCount = 0;
         const int maxErrors = 10;
-        
+
         while (_isRunning && _listener != null)
         {
             try
@@ -494,9 +502,26 @@ public partial class EIPServerTransport : IServerTransport, IDisposable
                 var tcp = await _listener.AcceptTcpClientAsync().ConfigureAwait(false);
                 errorCount = 0; // Reset on success
                 if (_isRunning)
-                    _ = Task.Run(() => HandleClientAsync(tcp), _cts!.Token);
+                {
+                    // Wrap the client handler to catch any unhandled exceptions that may
+                    // escape the ProcessAsync try/catch. This prevents a fire-and-forget
+                    // task from bringing down the entire process.
+                    _ = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            await HandleClientAsync(tcp).ConfigureAwait(false);
+                        }
+                        catch (Exception ex)
+                        {
+                            Logger.Warn(this, $"Unhandled exception in client handler: {ex.Message}");
+                        }
+                    }, _cts!.Token);
+                }
                 else
+                {
                     tcp.Close();
+                }
             }
             catch (ObjectDisposedException) { break; }
             catch (Exception ex)
@@ -504,13 +529,13 @@ public partial class EIPServerTransport : IServerTransport, IDisposable
                 errorCount++;
                 if (_isRunning)
                     Logger.Warn(this, $"Accept error ({errorCount}/{maxErrors}): {ex.Message}");
-                
+
                 if (errorCount >= maxErrors)
                 {
                     Logger.Warn(this, $"Too many accept errors, stopping listener");
                     break;
                 }
-                
+
                 await Task.Delay(100).ConfigureAwait(false);
             }
         }
@@ -809,11 +834,11 @@ public partial class EIPServerTransport : IServerTransport, IDisposable
             // Skip interfaces that are not operational
             if (ni.OperationalStatus != System.Net.NetworkInformation.OperationalStatus.Up)
                 continue;
-            
+
             // Skip loopback interfaces
             if (ni.NetworkInterfaceType == System.Net.NetworkInformation.NetworkInterfaceType.Loopback)
                 continue;
-            
+
             foreach (var ua in ni.GetIPProperties().UnicastAddresses)
             {
                 if (ua.Address.AddressFamily == AddressFamily.InterNetwork &&
@@ -1108,7 +1133,7 @@ public sealed partial class EIPServerTransport
                     // 65536-byte buffer. Reject that here, explicitly and before it is used to
                     // size a read, rather than letting Stream.ReadAsync's own bounds-check
                     // throw an ArgumentException that gets logged as a generic session error.
-                    if (24 + length > buf.Length)
+                    if (EIP_HEADER_LEN + length > buf.Length)
                     {
                         Logger.Warn(this, $"Rejected EIP request: length {length} exceeds receive buffer capacity — closing connection");
                         break;
@@ -1125,7 +1150,7 @@ public sealed partial class EIPServerTransport
                     {
                         if (length > 0)
                         {
-                            if (await ReadExactAsync(buf, 24, length, idleFirstByte: false).ConfigureAwait(false) < length)
+                            if (await ReadExactAsync(buf, EIP_HEADER_LEN, length, idleFirstByte: false).ConfigureAwait(false) < length)
                                 break;
                         }
 
@@ -1139,9 +1164,9 @@ public sealed partial class EIPServerTransport
 
                     if (length > 0)
                     {
-                        if (await ReadExactAsync(buf, 24, length, idleFirstByte: false).ConfigureAwait(false) < length)
+                        if (await ReadExactAsync(buf, EIP_HEADER_LEN, length, idleFirstByte: false).ConfigureAwait(false) < length)
                             break;
-                        Logger.Hex(this, "RX ←client:", buf, 24 + length);
+                        Logger.Hex(this, "RX ←client:", buf, EIP_HEADER_LEN + length);
                     }
 
                     // Dispatch command with the request context.
@@ -1307,7 +1332,7 @@ public sealed partial class EIPServerTransport
                 await SendErrorReply(EIP_REGISTER_SESSION, EIP_STATUS_INVALID_CMD, context).ConfigureAwait(false);
                 return;
             }
-            ushort requestedVersion = (ushort)(buf[24] | (buf[25] << 8));
+            ushort requestedVersion = (ushort)(buf[EIP_HEADER_LEN] | (buf[EIP_HEADER_LEN + 1] << 8));
 
             if (requestedVersion != EIP_TRANSPORT_VERSION)
             {
@@ -1415,7 +1440,7 @@ public sealed partial class EIPServerTransport
                 Logger.Info(this, "[WARN] HandleListIdentity: no valid IPv4 unicast address found");
                 return;
             }
-            
+
             IPEndPoint localEndpoint = new IPEndPoint(_transport._cachedLocalAddress, _transport._port);
             byte[] reply = _transport.BuildListIdentityResponse(context.SenderContext, _sessionHandle, localEndpoint);
             await SendRawResponse(reply, reply.Length).ConfigureAwait(false);
@@ -1465,10 +1490,10 @@ public sealed partial class EIPServerTransport
         private async Task HandleUnconnectedSend(byte[] buf, ushort length, EIPRequestContext context)
         {
             context.IsConnectedAtReceive = false;
-            int packetEnd = 24 + length;
 
             // Body starts immediately after the 24-byte EIP header.
-            int offset = 24;
+            int packetEnd = EIP_HEADER_LEN + length;
+            int offset = EIP_HEADER_LEN;
 
             // Interface Handle (4 bytes, always 0 for CIP) + Timeout (2 bytes).
             offset += 6;
@@ -1579,10 +1604,11 @@ public sealed partial class EIPServerTransport
         /// <param name="context">Request context (carries per-request state)</param>
         private async Task HandleConnectedSend(byte[] buf, ushort length, EIPRequestContext context)
         {
+            // Constants for EIP encapsulation and CPF prefix lengths.
             // Body starts immediately after the 24-byte EIP header.
             // Interface Handle (4 bytes, always 0 for CIP) + Timeout (2 bytes).
-            int offset = 24 + 6;
-            int packetEnd = 24 + length;
+            int packetEnd = EIP_HEADER_LEN + length;
+            int offset = EIP_HEADER_LEN + 6;
             if (packetEnd > buf.Length) return;
 
             if (offset + 2 > packetEnd) return;
