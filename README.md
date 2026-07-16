@@ -1,8 +1,6 @@
 # PcccGateway
 
-**Protocol Gateway for PCCC (Allen-Bradley)** — bridges EtherNet/IP clients to legacy PLCs via
-DF1 (serial), CSPv4 (TCP/2222), or EtherNet/IP. A modern, cross-platform software
-re-implementation of the discontinued **1761-NET-ENI** hardware bridge.
+**Protocol Gateway for PCCC (Allen-Bradley)** — a modern, cross-platform, software-defined PCCC gateway that bridges EtherNet/IP clients to legacy PLCs via DF1 (serial), CSPv4 (TCP/2222), or EtherNet/IP. Designed for reliability, performance, and ease of deployment—beyond the original 1761-NET-ENI hardware bridge.
 
 ## Overview
 
@@ -27,7 +25,7 @@ flowchart LR
 
     subgraph gw["PcccGateway"]
         direction LR
-        server["Server/<br/>EIPServerTransport<br/><i>emulates 1761-NET-ENI</i>"]
+        server["Server/<br/>EIPServerTransport<br/><i>emulates Allen-Bradley PLC</i>"]
         core["PcccGateway.cs<br/><i>routes by TNS</i>"]
         client["Client/<br/>DF1 / CSPv4 / EIP transport"]
         server -- PCCC --> core --> client
@@ -58,11 +56,14 @@ flowchart LR
 - ✅ Transparent PCCC forwarding — no address parsing or data conversion
 - ✅ Full EIP server implementation (RegisterSession, ListIdentity, Forward Open, Connected/Unconnected Send)
 - ✅ DF1 Full-Duplex (RS-232) with ACK/NAK, ENQ, CRC/BCC
-- ✅ DF1 Half-Duplex Master (RS-485) with multi-drop addressing
+- ✅ DF1 Half-Duplex Master (RS-485) with multi-drop addressing and echo suppression
 - ✅ CSPv4 transport with **magic number `00 04 00 05`** (verified against PLC-5/40E hardware)
 - ✅ EtherNet/IP backend for chaining to another EIP PLC or gateway
 - ✅ Per-request TNS correlation — replies never cross between concurrent clients
 - ✅ Multi-client support (up to 32 concurrent EIP clients)
+- ✅ Auto-reconnect with exponential backoff on link failure
+- ✅ Automatic PLC identity discovery (PLC-5, SLC, MicroLogix)
+- ✅ Robust error recovery and graceful shutdown
 - ✅ Diagnostic logging and health monitoring
 - ✅ Cross-platform: Windows, Linux, macOS (.NET 8)
 
@@ -86,7 +87,7 @@ flowchart LR
 PcccGateway/
 ├── PcccGateway.sln            solution (main project + tests)
 ├── src/PcccGateway/           the gateway (Client/ Common/ Interface/ Server/)
-└── tests/PcccGateway.Tests/   xUnit unit tests
+└── tests/PcccGateway.Tests/   xUnit unit tests (70+ tests)
 ```
 
 ## Building
@@ -101,8 +102,17 @@ dotnet build -c Release        # builds the whole solution
 dotnet test                    # runs the xUnit suite (no hardware required)
 ```
 
-Current coverage: DF1 CRC-16 / BCC checksum, DLE stuffing round-trip, and the
-receive-path ring buffer.
+The test suite includes 70+ tests covering:
+- DF1 full-duplex and half-duplex framing, checksum, ACK/NAK/ENQ, retry/backoff,
+  timeout, echo suppression, partial frame timeout, buffer overflow, and shutdown
+- EIP server boundary conditions and buffer overflow protection
+- Gateway TNS correlation, eviction, and circuit breaker
+- Transport lifecycle (Open/Close/Open cycles) and lifecycle token cancellation
+- Gateway end-to-end forwarding with TNS correlation (real TCP socket)
+- SerialPortWrapper channel-based byte ordering and dispatch
+- Asynchronous logging with bounded queue and forced log behavior
+- Identity resolver (PLC-5, SLC, MicroLogix), checksum, DLE stuffing, and ring buffer
+- All tests are async (no xUnit1031 warnings) and run serially to avoid static Logger interference
 
 ## Running
 

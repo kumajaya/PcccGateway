@@ -13,13 +13,14 @@
     <!-- Package / assembly metadata -->
     <Authors>Ketut Kumajaya</Authors>
     <Product>PcccGateway</Product>
-    <Description>Software PCCC protocol gateway — a 1761-NET-ENI replacement bridging EtherNet/IP clients to legacy PLCs over DF1, CSPv4, and EIP.</Description>
+    <Description>Modern, cross-platform, software-defined PCCC gateway bridging EtherNet/IP clients to legacy PLCs over DF1, CSPv4, and EIP.</Description>
     <Copyright>Copyright (c) 2026 Ketut Kumajaya</Copyright>
     <PackageLicenseExpression>LGPL-3.0-or-later</PackageLicenseExpression>
     <RepositoryUrl>https://github.com/kumajaya/PcccGateway</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <PackageProjectUrl>https://github.com/kumajaya/PcccGateway</PackageProjectUrl>
-    <Version>0.1.0</Version>
+    <Version>1.0.0</Version>
+    <PackageTags>pccc;allen-bradley;plc;gateway;df1;csp;eip;ethernet-ip;automation;scada</PackageTags>
   </PropertyGroup>
 
   <ItemGroup>
