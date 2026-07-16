@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Sockets;
+using System.Threading;
 using PcccGateway.Server;
 using Xunit;
 
@@ -76,13 +77,14 @@ public class EIPServerParserTests : IDisposable
         return await ReadExactAsync(stream, 28);
     }
 
-    private static async Task<TcpClient> ConnectAndRegisterAsync(int port)
+    private static async Task<(TcpClient Client, uint SessionHandle)> ConnectAndRegisterAsync(int port)
     {
         var client = new TcpClient();
         await client.ConnectAsync(IPAddress.Loopback, port);
         var stream = client.GetStream();
-        await RegisterSessionAsync(stream);
-        return client;
+        byte[] response = await RegisterSessionAsync(stream);
+        uint sessionHandle = ReadU32(response, 4);
+        return (client, sessionHandle);
     }
 
     /// <summary>
@@ -182,7 +184,8 @@ public class EIPServerParserTests : IDisposable
     [Fact]
     public async Task ForwardOpen_ReturnsSuccessResponse()
     {
-        using var client = await ConnectAndRegisterAsync(_port);
+        var (client, sessionHandle) = await ConnectAndRegisterAsync(_port);
+        using var _ = client;
         var stream = client.GetStream();
 
         uint otConnId = 0x12345678;
@@ -190,7 +193,7 @@ public class EIPServerParserTests : IDisposable
         ushort connSerial = 0xABCD;
 
         byte[] req = BuildForwardOpenRequest(otConnId, toConnId, connSerial);
-        byte[] packet = BuildSendRRDataPacket(0, req); // session handle is 0 for Unconnected Send
+        byte[] packet = BuildSendRRDataPacket(sessionHandle, req);
         await stream.WriteAsync(packet);
 
         // Read header
@@ -235,7 +238,8 @@ public class EIPServerParserTests : IDisposable
     [Fact]
     public async Task ForwardOpen_ThenForwardClose_Succeeds()
     {
-        using var client = await ConnectAndRegisterAsync(_port);
+        var (client, sessionHandle) = await ConnectAndRegisterAsync(_port);
+        using var _ = client;
         var stream = client.GetStream();
 
         uint otConnId = 0x12345678;
@@ -244,7 +248,7 @@ public class EIPServerParserTests : IDisposable
 
         // Step 1: Forward Open
         byte[] fwdOpenReq = BuildForwardOpenRequest(otConnId, toConnId, connSerial);
-        byte[] openPacket = BuildSendRRDataPacket(0, fwdOpenReq);
+        byte[] openPacket = BuildSendRRDataPacket(sessionHandle, fwdOpenReq);
         await stream.WriteAsync(openPacket);
 
         // Read Forward Open response
@@ -261,7 +265,7 @@ public class EIPServerParserTests : IDisposable
 
         // Step 2: Forward Close
         byte[] fwdCloseReq = BuildForwardCloseRequest(connSerial);
-        byte[] closePacket = BuildSendRRDataPacket(0, fwdCloseReq);
+        byte[] closePacket = BuildSendRRDataPacket(sessionHandle, fwdCloseReq);
         await stream.WriteAsync(closePacket);
 
         // Read Forward Close response
@@ -280,6 +284,43 @@ public class EIPServerParserTests : IDisposable
         byte closeGeneralStatus = closeRespBody[off + 2];
         Assert.Equal((byte)0xCE, closeReplySvc); // Forward Close response
         Assert.Equal((byte)0x00, closeGeneralStatus);
+    }
+
+    [Fact]
+    public async Task ForwardOpen_WrongSessionHandle_IsRejectedOrIgnored()
+    {
+        var (client, sessionHandle) = await ConnectAndRegisterAsync(_port);
+        using var _ = client;
+        var stream = client.GetStream();
+
+        byte[] req = BuildForwardOpenRequest(0x12345678, 0x87654321, 0xABCD);
+        byte[] packet = BuildSendRRDataPacket(sessionHandle + 1, req);
+        await stream.WriteAsync(packet);
+
+        var header = new byte[24];
+        int read = 0;
+        using var cts = new CancellationTokenSource(500);
+        try
+        {
+            while (read < 24)
+            {
+                int n = await stream.ReadAsync(header, read, 24 - read, cts.Token);
+                if (n == 0) break;
+                read += n;
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            read = 0;
+        }
+
+        if (read > 0)
+        {
+            ushort command = ReadU16(header, 0);
+            uint status = ReadU32(header, 8);
+            Assert.True(command != 0x006F || status != 0u,
+                "Server accepted Forward Open with a wrong session handle.");
+        }
     }
 
     public void Dispose()

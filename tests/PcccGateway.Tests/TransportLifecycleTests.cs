@@ -11,7 +11,12 @@ namespace PcccGateway.Tests;
 /// </summary>
 public class TransportLifecycleTests
 {
-    private const int TEST_PORT = 44818;
+    private static int GetFreePort()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        return ((IPEndPoint)listener.LocalEndpoint).Port;
+    }
 
     /// <summary>
     /// Simple TCP echo server that can handle basic CSPv4 handshake.
@@ -95,10 +100,11 @@ public class TransportLifecycleTests
     [Fact]
     public async Task EIPTransport_Open_Close_Open_SendFrame_Succeeds()
     {
-        using var server = new EchoServer(TEST_PORT);
+        int port = GetFreePort();
+        using var server = new EchoServer(port);
         server.Start();
 
-        var transport = new EIPTransport("127.0.0.1", TEST_PORT, 5000);
+        var transport = new EIPTransport("127.0.0.1", port, 5000);
 
         try
         {
@@ -120,11 +126,11 @@ public class TransportLifecycleTests
     [Fact]
     public async Task CSPTransport_Open_Close_Open_SendFrame_Succeeds()
     {
-        // Use port 2222 (CSP default). EchoServer handles CSP RegisterSession correctly.
-        using var server = new EchoServer(2222);
+        int port = GetFreePort();
+        using var server = new EchoServer(port);
         server.Start();
 
-        var transport = new CSPTransport("127.0.0.1", 2222, 5000);
+        var transport = new CSPTransport("127.0.0.1", port, 5000);
 
         try
         {
@@ -152,10 +158,11 @@ public class TransportLifecycleTests
     [Fact]
     public async Task EIPTransport_Close_CancelsLifecycleToken()
     {
-        using var server = new EchoServer(TEST_PORT);
+        int port = GetFreePort();
+        using var server = new EchoServer(port);
         server.Start();
 
-        var transport = new EIPTransport("127.0.0.1", TEST_PORT, 5000);
+        var transport = new EIPTransport("127.0.0.1", port, 5000);
 
         try
         {
