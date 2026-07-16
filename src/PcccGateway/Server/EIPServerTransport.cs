@@ -1115,9 +1115,23 @@ public sealed partial class EIPServerTransport
                     }
 
                     // Session handle at offset 4 (uint, LE).
+                    uint sessionHandle = BitConverter.ToUInt32(buf, 4);
                     // Status at offset 8 — checked per-command where needed.
                     // Sender Context at offset 12 (uint64, LE) — will be echoed in reply.
                     ulong senderContext = BitConverter.ToUInt64(buf, 12);
+
+                    if ((command == EIP_UNREGISTER_SESSION || command == EIP_UNCONNECTED_SEND || command == EIP_CONNECTED_SEND) &&
+                        (!_isRegistered || sessionHandle != _sessionHandle))
+                    {
+                        if (length > 0)
+                        {
+                            if (await ReadExactAsync(buf, 24, length, idleFirstByte: false).ConfigureAwait(false) < length)
+                                break;
+                        }
+
+                        Logger.Info(this, $"Rejected EIP request for session handle 0x{sessionHandle:X8} — expected 0x{_sessionHandle:X8}");
+                        continue;
+                    }
 
                     // Create request context BEFORE reading payload. This context
                     // will carry all per-request state through the pipeline.
@@ -1565,13 +1579,17 @@ public sealed partial class EIPServerTransport
         /// <param name="context">Request context (carries per-request state)</param>
         private async Task HandleConnectedSend(byte[] buf, ushort length, EIPRequestContext context)
         {
-            int offset = 24 + 6; // EIP header + Interface Handle(4) + Timeout(2)
+            // Body starts immediately after the 24-byte EIP header.
+            // Interface Handle (4 bytes, always 0 for CIP) + Timeout (2 bytes).
+            int offset = 24 + 6;
+            int packetEnd = 24 + length;
+            if (packetEnd > buf.Length) return;
 
-            if (offset + 2 > buf.Length) return;
+            if (offset + 2 > packetEnd) return;
             ushort itemCount = (ushort)(buf[offset] | (buf[offset + 1] << 8));
             offset += 2;
 
-            for (int i = 0; i < itemCount && offset + 4 <= buf.Length; i++)
+            for (int i = 0; i < itemCount && offset + 4 <= packetEnd; i++)
             {
                 ushort itemType   = (ushort)(buf[offset]     | (buf[offset + 1] << 8));
                 ushort itemLength = (ushort)(buf[offset + 2] | (buf[offset + 3] << 8));
@@ -1581,6 +1599,8 @@ public sealed partial class EIPServerTransport
 
                 if (itemType == CPF_ITEM_CONNECTED_ADDRESS && itemLength >= 4)
                 {
+                    if (itemStart + itemLength > packetEnd) return;
+
                     uint connId = (uint)(buf[offset]     | (buf[offset + 1] << 8) |
                                         (buf[offset + 2] << 16) | (buf[offset + 3] << 24));
 
@@ -1601,8 +1621,8 @@ public sealed partial class EIPServerTransport
                 }
                 else if (itemType == CPF_ITEM_CONNECTED_DATA && itemLength >= 2)
                 {
-                    // Validate that itemLength does not exceed the remaining buffer.
-                    if (offset + itemLength > buf.Length)
+                    // Validate that the declared item length does not exceed the packet boundary.
+                    if (itemStart + itemLength > packetEnd)
                     {
                         Logger.Warn(this, "Connected Send: itemLength exceeds buffer – dropping");
                         return;
@@ -1645,12 +1665,15 @@ public sealed partial class EIPServerTransport
         private async Task HandleForwardOpen(byte[] buf, int offset,
                                             ushort length, bool isExtended, EIPRequestContext context)
         {
+            int requestEnd = offset + length;
+            if (requestEnd > buf.Length) return;
+
             offset++;  // skip service code byte
-            if (offset >= buf.Length) return;
+            if (offset >= requestEnd) return;
 
             byte pathSize = buf[offset++];
-            // Validate pathSize does not exceed buffer.
-            if (offset + pathSize * 2 > buf.Length)
+            // Validate pathSize does not exceed request boundary.
+            if (offset + pathSize * 2 > requestEnd)
             {
                 Logger.Warn(this, "Forward Open: pathSize exceeds buffer – dropping");
                 return;
@@ -1658,7 +1681,8 @@ public sealed partial class EIPServerTransport
             offset += pathSize * 2;  // skip connection path
 
             // Both standard and extended Forward Open share these fields.
-            if (offset + 14 > buf.Length) return;
+            const int commonFixedLength = 22;
+            if (offset + commonFixedLength > requestEnd) return;
             _ = buf[offset++]; // secsPerTick  — not stored, we use RPI_US
             _ = buf[offset++]; // timeoutTicks — not stored
             uint   otConnId   = ReadU32(buf, ref offset); // O→T proposed ID
@@ -1671,9 +1695,17 @@ public sealed partial class EIPServerTransport
 
             // Skip RPI and connection parameter fields (different widths per variant).
             if (isExtended)
-                offset += 4 + 4 + 4 + 4 + 1; // otRpi(4) + otParamsEx(4) + toRpi(4) + toParamsEx(4) + transport(1)
+            {
+                const int extendedSuffixLength = 17;
+                if (offset + extendedSuffixLength > requestEnd) return;
+                offset += extendedSuffixLength; // otRpi(4) + otParamsEx(4) + toRpi(4) + toParamsEx(4) + transport(1)
+            }
             else
-                offset += 4 + 2 + 4 + 2 + 1; // otRpi(4) + otParams(2)   + toRpi(4) + toParams(2)   + transport(1)
+            {
+                const int standardSuffixLength = 13;
+                if (offset + standardSuffixLength > requestEnd) return;
+                offset += standardSuffixLength; // otRpi(4) + otParams(2) + toRpi(4) + toParams(2) + transport(1)
+            }
 
             // Generate a unique connection ID for this session. The high bit
             // distinguishes server-generated IDs from client-generated ones.

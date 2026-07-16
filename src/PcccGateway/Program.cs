@@ -193,65 +193,73 @@ class Program
         }
 
         // ── Start the gateway ────────────────────────────────────────────────
-        using var gateway = new Gateway(plcTransport, eipPort: listenPort, bindAddress: bindAddr);
-
-        gateway.PduForwarded      += (s, e) => Logger.Info(null, $"[FWD] gwTNS=0x{e.tns:X4} len={e.pdu.Length}");
-        gateway.PduReplyForwarded += (s, e) => Logger.Info(null, $"[REP] TNS=0x{e.tns:X4} len={e.pdu.Length}");
-
+        Gateway? gateway = null;
         try
         {
-            gateway.Start();
-        }
-        catch (System.Net.Sockets.SocketException ex)
-        {
-            Console.Error.WriteLine(
-                $"Failed to start EIP server on port {listenPort}: {ex.Message}");
-            Console.Error.WriteLine(
-                $"Port {listenPort} is likely already in use (another gateway, PCCCEmulator, " +
-                "or RSLinx). Pick a free port with --listen-port <n>.");
-            return 3;
-        }
+            gateway = new Gateway(plcTransport, eipPort: listenPort, bindAddress: bindAddr);
 
-        // Configuration summary.
-        Console.WriteLine($"      Mode        : {mode}");
-        if (mode is "df1" or "df1master" or "df1slave")
-        {
-            Console.WriteLine($"      Port        : {portName}");
-            Console.WriteLine($"      Baud rate   : {baud}");
-            Console.WriteLine($"      Parity      : {parity}");
-            Console.WriteLine($"      Checksum    : {checkSumOpt}");
-            if (mode != "df1")
+            gateway.PduForwarded      += (s, e) => Logger.Info(null, $"[FWD] gwTNS=0x{e.tns:X4} len={e.pdu.Length}");
+            gateway.PduReplyForwarded += (s, e) => Logger.Info(null, $"[REP] TNS=0x{e.tns:X4} len={e.pdu.Length}");
+
+            try
             {
-                Console.WriteLine($"      Slave node  : {target}");
-                Console.WriteLine($"      RS-485 mode : {rs485Mode}");
+                gateway.Start();
             }
-        }
-        else if (mode == "csp")
-        {
-            Console.WriteLine($"      PLC host    : {host}:{cspPort}");
-            Console.WriteLine($"      LSAP control: 0x{lsapControl:X2}");
-        }
-        else if (mode == "eip")
-        {
-            Console.WriteLine($"      PLC host    : {host}:{plcEipPort}");
-        }
-        Console.WriteLine($"      EIP listen  : {(bindAddr?.ToString() ?? "0.0.0.0")}:{listenPort}");
-        Console.WriteLine($"      Logging     : {(quiet ? "Disabled (High Performance)" : "Enabled")}");
-        Console.WriteLine();
-        Console.WriteLine("Connect your EIP client (RSLinx, libplctag, pycomm3, etc.) to this gateway.");
-        Console.WriteLine("Press Ctrl+C to stop.");
+            catch (System.Net.Sockets.SocketException ex)
+            {
+                Console.Error.WriteLine(
+                    $"Failed to start EIP server on port {listenPort}: {ex.Message}");
+                Console.Error.WriteLine(
+                    $"Port {listenPort} is likely already in use (another gateway, PCCCEmulator, " +
+                    "or RSLinx). Pick a free port with --listen-port <n>.");
+                return 3;
+            }
 
-        // Block until Ctrl+C (SIGINT/SIGTERM). Works whether stdin is a console
-        // or redirected, so the process runs cleanly as a service/container.
-        using var stop = new ManualResetEventSlim(false);
-        Console.CancelKeyPress += (s, e) => { e.Cancel = true; stop.Set(); };
-        AppDomain.CurrentDomain.ProcessExit += (s, e) => stop.Set();
-        stop.Wait();
+            // Configuration summary.
+            Console.WriteLine($"      Mode        : {mode}");
+            if (mode is "df1" or "df1master" or "df1slave")
+            {
+                Console.WriteLine($"      Port        : {portName}");
+                Console.WriteLine($"      Baud rate   : {baud}");
+                Console.WriteLine($"      Parity      : {parity}");
+                Console.WriteLine($"      Checksum    : {checkSumOpt}");
+                if (mode != "df1")
+                {
+                    Console.WriteLine($"      Slave node  : {target}");
+                    Console.WriteLine($"      RS-485 mode : {rs485Mode}");
+                }
+            }
+            else if (mode == "csp")
+            {
+                Console.WriteLine($"      PLC host    : {host}:{cspPort}");
+                Console.WriteLine($"      LSAP control: 0x{lsapControl:X2}");
+            }
+            else if (mode == "eip")
+            {
+                Console.WriteLine($"      PLC host    : {host}:{plcEipPort}");
+            }
+            Console.WriteLine($"      EIP listen  : {(bindAddr?.ToString() ?? "0.0.0.0")}:{listenPort}");
+            Console.WriteLine($"      Logging     : {(quiet ? "Disabled (High Performance)" : "Enabled")}");
+            Console.WriteLine();
+            Console.WriteLine("Connect your EIP client (RSLinx, libplctag, pycomm3, etc.) to this gateway.");
+            Console.WriteLine("Press Ctrl+C to stop.");
 
-        gateway.Stop();
-        Logger.Shutdown();
-        Console.WriteLine("Gateway stopped.");
-        return 0;
+            // Block until Ctrl+C (SIGINT/SIGTERM). Works whether stdin is a console
+            // or redirected, so the process runs cleanly as a service/container.
+            using var stop = new ManualResetEventSlim(false);
+            Console.CancelKeyPress += (s, e) => { e.Cancel = true; stop.Set(); };
+            AppDomain.CurrentDomain.ProcessExit += (s, e) => stop.Set();
+            stop.Wait();
+
+            gateway.Stop();
+            Console.WriteLine("Gateway stopped.");
+            return 0;
+        }
+        finally
+        {
+            gateway?.Stop(); // Ensure cleanup even if Start() threw or was interrupted.
+            Logger.Shutdown(1000);
+        }
     }
 
     // LSAP control byte for csp mode; hex, default 0x00 (see CSPTransport remarks).

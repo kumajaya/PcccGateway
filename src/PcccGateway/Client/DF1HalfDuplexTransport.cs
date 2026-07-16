@@ -286,7 +286,10 @@ public class DF1HalfDuplexTransport : DF1BaseTransport
                     if (wasNak && SleepDelay < 400)
                         SleepDelay += 50;
                     if (WaitForShutdownOrDelay(SleepDelay > 0 ? SleepDelay : 20))
-                        _closing = true;
+                    {
+                        _currentState = MasterState.Idle;
+                        throw new TimeoutException("Send aborted: transport is closing.");
+                    }
                 }
             }
             finally
