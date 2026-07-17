@@ -318,7 +318,10 @@ public class DF1HalfDuplexTransportTests
         // Final ACK should be written (write #3)
         await WaitForWriteCountAsync(port, 3, 1000);
 
-        await sendTask.WaitAsync(TimeSpan.FromMilliseconds(2000));
+        // Generous timeout: the task itself finishes near-instantly once woken,
+        // this only guards against ThreadPool scheduling jitter on a contended
+        // CI runner (see ThreadPoolWarmup / AssemblyTestConfig.cs).
+        await sendTask.WaitAsync(TimeSpan.FromMilliseconds(5000));
 
         Assert.Equal(responseInner, received);
     }
