@@ -410,7 +410,7 @@ public partial class EIPServerTransport : IServerTransport, IDisposable
         if (clientContext is not EIPRequestContext context) return;
         if (!context.Client.IsConnected) return;
 
-        Logger.Info(this, $"SendResponse → session {context.Client.SessionHandle:X8}, PDU length={pdu.Length}");
+        Logger.Info(this, $"SendResponse -> session {context.Client.SessionHandle:X8}, PDU length={pdu.Length}");
 
         // Use SendSerializedAsync to guarantee FIFO ordering of responses
         // within a single client session.  The discard (_=) is intentional:
@@ -595,7 +595,7 @@ public partial class EIPServerTransport : IServerTransport, IDisposable
             {
                 var result = await _udpListener.ReceiveAsync().ConfigureAwait(false);
                 var data   = result.Buffer;
-                Logger.Hex(this, "RX ←client:", data, data.Length);
+                Logger.Hex(this, "RX <-client:", data, data.Length);
 
                 // Minimum EIP header is 24 bytes.
                 if (data.Length < 24) continue;
@@ -611,7 +611,7 @@ public partial class EIPServerTransport : IServerTransport, IDisposable
                 ulong senderCtx = BitConverter.ToUInt64(data, 12);
 
                 byte[] reply = BuildListIdentityResponse(senderCtx, sessionHandle: 0, localEndpoint);
-                Logger.Hex(this, "TX →client:", reply, reply.Length);
+                Logger.Hex(this, "TX ->client:", reply, reply.Length);
                 await _udpListener.SendAsync(reply, reply.Length, result.RemoteEndPoint)
                                   .ConfigureAwait(false);
 
@@ -1081,7 +1081,7 @@ public sealed partial class EIPServerTransport
         /// </summary>
         private async Task SendRawResponse(byte[] data, int length)
         {
-            Logger.Hex(this, "TX →client:", data, length);
+            Logger.Hex(this, "TX ->client:", data, length);
             await _stream.WriteAsync(data, 0, length).ConfigureAwait(false);
         }
 
@@ -1166,7 +1166,7 @@ public sealed partial class EIPServerTransport
                     {
                         if (await ReadExactAsync(buf, EIP_HEADER_LEN, length, idleFirstByte: false).ConfigureAwait(false) < length)
                             break;
-                        Logger.Hex(this, "RX ←client:", buf, EIP_HEADER_LEN + length);
+                        Logger.Hex(this, "RX <-client:", buf, EIP_HEADER_LEN + length);
                     }
 
                     // Dispatch command with the request context.
@@ -1758,7 +1758,7 @@ public sealed partial class EIPServerTransport
                 }
 
                 Logger.Info(this, $"ForwardOpen{(isExtended ? "Ex" : "")}: " +
-                    $"OT=0x{otConnId:X8} TO=0x{toConnId:X8} → assigned TargID=0x{newId:X8}, " +
+                    $"OT=0x{otConnId:X8} TO=0x{toConnId:X8} -> assigned TargID=0x{newId:X8}, " +
                     $"Active connections={_connections.Count}");
 
                 await SendForwardOpenResponse(newId, toConnId, connSerial, vendorId, serialNum, isExtended, context)

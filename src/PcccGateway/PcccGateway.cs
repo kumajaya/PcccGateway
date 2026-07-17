@@ -121,8 +121,8 @@ public class Gateway : IDisposable
         // at the byte level and the log stops at the gateway. The sender is the
         // transport itself, so the category tag (DFU/DFS/CSP/EIP/P) is correct
         // automatically, and the arrows state the direction unambiguously.
-        _plcTransport.RawFrameSent     += (sndr, f) => Logger.Hex(sndr, "TX →PLC:", f, f.Length);
-        _plcTransport.RawFrameReceived += (sndr, f) => Logger.Hex(sndr, "RX ←PLC:", f, f.Length);
+        _plcTransport.RawFrameSent     += (sndr, f) => Logger.Hex(sndr, "TX ->PLC:", f, f.Length);
+        _plcTransport.RawFrameReceived += (sndr, f) => Logger.Hex(sndr, "RX <-PLC:", f, f.Length);
     }
 
     /// <summary>
@@ -201,7 +201,7 @@ public class Gateway : IDisposable
         pdu[4] = (byte)(gwTns & 0xFF);
         pdu[5] = (byte)((gwTns >> 8) & 0xFF);
 
-        Logger.Hex(this, $"EIP → PLC gwTNS=0x{gwTns:X4} (client TNS=0x{originalTns:X4})", pdu, pdu.Length);
+        Logger.Hex(this, $"EIP -> PLC gwTNS=0x{gwTns:X4} (client TNS=0x{originalTns:X4})", pdu, pdu.Length);
 
         try
         {
@@ -240,7 +240,7 @@ public class Gateway : IDisposable
             replyPdu[4] = (byte)(pend.OriginalTns & 0xFF);
             replyPdu[5] = (byte)((pend.OriginalTns >> 8) & 0xFF);
 
-            Logger.Hex(this, $"PLC → EIP client TNS=0x{pend.OriginalTns:X4} (gwTNS=0x{gwTns:X4})", replyPdu, replyPdu.Length);
+            Logger.Hex(this, $"PLC -> EIP client TNS=0x{pend.OriginalTns:X4} (gwTNS=0x{gwTns:X4})", replyPdu, replyPdu.Length);
             _eipTransport.SendResponse(replyPdu, pend.Context);
             PduReplyForwarded?.Invoke(this, (replyPdu, pend.OriginalTns));
         }
