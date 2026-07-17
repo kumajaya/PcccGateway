@@ -318,7 +318,7 @@ public partial class EIPServerTransport : IServerTransport, IDisposable
             elapsed += stepMs;
         }
         if (active > 0)
-            Logger.Info(this, $"Stop: {active} request(s) still active after {maxWaitMs} ms — forcing shutdown");
+            Logger.Info(this, $"Stop: {active} request(s) still active after {maxWaitMs} ms - forcing shutdown");
 
         // Dispose all client connections.
         lock (_clientLock)
@@ -432,7 +432,7 @@ public partial class EIPServerTransport : IServerTransport, IDisposable
         {
             // Activate periodic health stats when verbose logging is off.
             _healthTimer ??= new Timer(_ => LogHealthStats(), null, 15_000, 15_000);
-            Logger.Always(this, "Logging disabled — health monitor active");
+            Logger.Always(this, "Logging disabled - health monitor active");
         }
         else
         {
@@ -460,7 +460,7 @@ public partial class EIPServerTransport : IServerTransport, IDisposable
             $"Memory: {GC.GetTotalMemory(false) / 1024,6:N0} KB");
 
         if (delta == 0 && cur > 0)
-            Logger.Always(this, "No frames in last 15 s — check client connection");
+            Logger.Always(this, "No frames in last 15 s - check client connection");
     }
 
     // ── Request lifecycle guard ──────────────────────────────────────────────
@@ -1135,7 +1135,7 @@ public sealed partial class EIPServerTransport
                     // throw an ArgumentException that gets logged as a generic session error.
                     if (EIP_HEADER_LEN + length > buf.Length)
                     {
-                        Logger.Warn(this, $"Rejected EIP request: length {length} exceeds receive buffer capacity — closing connection");
+                        Logger.Warn(this, $"Rejected EIP request: length {length} exceeds receive buffer capacity - closing connection");
                         break;
                     }
 
@@ -1154,7 +1154,7 @@ public sealed partial class EIPServerTransport
                                 break;
                         }
 
-                        Logger.Info(this, $"Rejected EIP request for session handle 0x{sessionHandle:X8} — expected 0x{_sessionHandle:X8}");
+                        Logger.Info(this, $"Rejected EIP request for session handle 0x{sessionHandle:X8} - expected 0x{_sessionHandle:X8}");
                         continue;
                     }
 
@@ -1237,7 +1237,7 @@ public sealed partial class EIPServerTransport
                         }
                         catch (OperationCanceledException)
                         {
-                            throw new IOException("Partial EIP request timed out — dropping connection.");
+                            throw new IOException("Partial EIP request timed out - dropping connection.");
                         }
                     }
                     if (n == 0) break;
@@ -1293,17 +1293,17 @@ public sealed partial class EIPServerTransport
                     break;
 
                 case EIP_UNCONNECTED_SEND:
-                    if (!_isRegistered) { Logger.Info(this, "Unconnected Send rejected — no session"); return; }
+                    if (!_isRegistered) { Logger.Info(this, "Unconnected Send rejected - no session"); return; }
                     await HandleUnconnectedSend(buf, length, context).ConfigureAwait(false);
                     break;
 
                 case EIP_CONNECTED_SEND:
-                    if (!_isRegistered) { Logger.Info(this, "Connected Send rejected — no session"); return; }
+                    if (!_isRegistered) { Logger.Info(this, "Connected Send rejected - no session"); return; }
                     await HandleConnectedSend(buf, length, context).ConfigureAwait(false);
                     break;
 
                 default:
-                    Logger.Info(this, $"Unknown command 0x{command:X4} — sending error reply");
+                    Logger.Info(this, $"Unknown command 0x{command:X4} - sending error reply");
                     await SendErrorReply(command, EIP_STATUS_INVALID_CMD, context).ConfigureAwait(false);
                     break;
             }
@@ -1328,7 +1328,7 @@ public sealed partial class EIPServerTransport
             // reused receive buffer and validate the version against garbage.
             if (length < 4)
             {
-                Logger.Info(this, $"RegisterSession: payload too short ({length} bytes) — rejected");
+                Logger.Info(this, $"RegisterSession: payload too short ({length} bytes) - rejected");
                 await SendErrorReply(EIP_REGISTER_SESSION, EIP_STATUS_INVALID_CMD, context).ConfigureAwait(false);
                 return;
             }
@@ -1523,7 +1523,7 @@ public sealed partial class EIPServerTransport
                 {
                     if (itemStart + itemLength > packetEnd)
                     {
-                        Logger.Warn(this, "Unconnected Send: declared item length exceeds packet boundary – dropping");
+                        Logger.Warn(this, "Unconnected Send: declared item length exceeds packet boundary - dropping");
                         return;
                     }
 
@@ -1572,7 +1572,7 @@ public sealed partial class EIPServerTransport
                         // Validate that ucLen does not exceed the remaining packet.
                         if (inner + ucLen > packetEnd)
                         {
-                            Logger.Warn(this, "CM Unconnected Send: ucLen exceeds buffer – dropping");
+                            Logger.Warn(this, "CM Unconnected Send: ucLen exceeds buffer - dropping");
                             return;
                         }
 
@@ -1636,7 +1636,7 @@ public sealed partial class EIPServerTransport
 
                     if (conn == null)
                     {
-                        Logger.Info(this, $"Connected Send: bad connection ID 0x{connId:X8} — packet dropped");
+                        Logger.Info(this, $"Connected Send: bad connection ID 0x{connId:X8} - packet dropped");
                         return;
                     }
 
@@ -1650,7 +1650,7 @@ public sealed partial class EIPServerTransport
                     // Validate that the declared item length does not exceed the packet boundary.
                     if (itemStart + itemLength > packetEnd)
                     {
-                        Logger.Warn(this, "Connected Send: itemLength exceeds buffer – dropping");
+                        Logger.Warn(this, "Connected Send: itemLength exceeds buffer - dropping");
                         return;
                     }
 
@@ -1701,7 +1701,7 @@ public sealed partial class EIPServerTransport
             // Validate pathSize does not exceed request boundary.
             if (offset + pathSize * 2 > requestEnd)
             {
-                Logger.Warn(this, "Forward Open: pathSize exceeds buffer – dropping");
+                Logger.Warn(this, "Forward Open: pathSize exceeds buffer - dropping");
                 return;
             }
             offset += pathSize * 2;  // skip connection path
@@ -1970,7 +1970,7 @@ public sealed partial class EIPServerTransport
             // Validate path size does not exceed bounds.
             if (offset + pathBytes > buf.Length || offset + pathBytes > itemEnd)
             {
-                Logger.Warn(this, "ExtractAndDispatchPCCC: pathSize exceeds buffer – dropping");
+                Logger.Warn(this, "ExtractAndDispatchPCCC: pathSize exceeds buffer - dropping");
                 return;
             }
             offset += pathBytes;
@@ -1984,7 +1984,7 @@ public sealed partial class EIPServerTransport
             // Validate requestIdSize is exactly 7 (the standard size).
             if (requestIdSize != 7)
             {
-                Logger.Warn(this, $"ExtractAndDispatchPCCC: unexpected requestIdSize {requestIdSize} – dropping");
+                Logger.Warn(this, $"ExtractAndDispatchPCCC: unexpected requestIdSize {requestIdSize} - dropping");
                 return;
             }
 

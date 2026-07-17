@@ -186,7 +186,7 @@ public class Gateway : IDisposable
         // transparent gateway.
         if (!_plcTransport.IsOpen)
         {
-            Logger.Warn(this, "PLC link down — request dropped");
+            Logger.Warn(this, "PLC link down - request dropped");
             _linkWake.Set();
             return;
         }
@@ -246,7 +246,7 @@ public class Gateway : IDisposable
         }
         else
         {
-            Logger.Warn(this, $"Received reply for unknown/expired gwTNS=0x{gwTns:X4} — ignored");
+            Logger.Warn(this, $"Received reply for unknown/expired gwTNS=0x{gwTns:X4} - ignored");
         }
     }
 
@@ -335,7 +335,7 @@ public class Gateway : IDisposable
                 }
                 catch (Exception ex)
                 {
-                    Logger.Warn(this, $"PLC connect failed: {ex.Message} — retrying in {delay} ms");
+                    Logger.Warn(this, $"PLC connect failed: {ex.Message} - retrying in {delay} ms");
                     if (WaitOrCancel(delay, ct)) break;
                     delay = Math.Min(delay * 2, ReconnectMaxDelayMs);
                     continue;
@@ -392,11 +392,11 @@ public class Gateway : IDisposable
             }
             else if (payload != null)
             {
-                Logger.Warn(this, "Identity discovery: PLC rejected diagnostic probe — retaining last-known identity");
+                Logger.Warn(this, "Identity discovery: PLC rejected diagnostic probe - retaining last-known identity");
             }
             else
             {
-                Logger.Info(this, "Identity discovery: no PLC response — forcing reconnect");
+                Logger.Info(this, "Identity discovery: no PLC response - forcing reconnect");
                 // Probe failed (timeout or no response). Close the transport to trigger
                 // a full reconnect cycle, which will re-run identity discovery.
                 _plcTransport.Close();
@@ -455,7 +455,7 @@ public class Gateway : IDisposable
                     return reply[6..];
                 if (reply.Length > 3 && reply[3] != 0x00)
                 {
-                    Logger.Warn(this, $"Identity probe: PLC returned STS=0x{reply[3]:X2} — ignoring");
+                    Logger.Warn(this, $"Identity probe: PLC returned STS=0x{reply[3]:X2} - ignoring");
                     return Array.Empty<byte>();
                 }
                 return null;
