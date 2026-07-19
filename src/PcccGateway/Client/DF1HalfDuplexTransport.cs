@@ -384,7 +384,7 @@ public class DF1HalfDuplexTransport : DF1BaseTransport
                             // and this reset, the reset wipes the wake-up and we sit
                             // out the full ACK timeout while Close() waits on _txLock.
                             if (_closing || _disposing)
-                                throw new TimeoutException("Send aborted: transport is closing.");
+                                throw new InvalidOperationException("Send aborted: transport is closing.");
 
                             ResetTransactionFlags();
                             _currentState = MasterState.WaitingForCommandAck;
@@ -406,7 +406,7 @@ public class DF1HalfDuplexTransport : DF1BaseTransport
                         // Shutdown requested: stop retrying and surface as a send failure rather
                         // than exhausting all attempts and their backoff delays.
                         if (_closing || _disposing)
-                            throw new TimeoutException("Send aborted: transport is closing.");
+                            throw new InvalidOperationException("Send aborted: transport is closing.");
 
                         // If this was the last attempt, throw timeout exception
                         if (attempt == maxCmdRetries - 1)
@@ -417,7 +417,7 @@ public class DF1HalfDuplexTransport : DF1BaseTransport
                         if (wasNak && SleepDelay < 400)
                             SleepDelay += 50;
                         if (WaitForShutdownOrDelay(SleepDelay > 0 ? SleepDelay : 20))
-                            throw new TimeoutException("Send aborted: transport is closing.");
+                            throw new InvalidOperationException("Send aborted: transport is closing.");
                     }
                 }
                 finally
@@ -1015,6 +1015,12 @@ public class DF1HalfDuplexTransport : DF1BaseTransport
                 _closing = true;
                 _shutdownEvent.Set();
                 try { _stateEvent.Set(); } catch { }
+
+                // Shut the write gate here, not after _txLock is acquired: an
+                // in-flight SendFrame holds that lock, and until the gate closes
+                // it can still put a command or poll on the wire that its caller
+                // will be told failed.
+                CloseWireGate();
                 // Active operations will be drained once they notice _closing.
                 // We must not wait here with _stateLock held because SendFrame
                 // may be inside a TryBeginActiveOperation/EndActiveOperation block
@@ -1058,6 +1064,12 @@ public class DF1HalfDuplexTransport : DF1BaseTransport
                 _closing = true;
                 _shutdownEvent.Set();
                 try { _stateEvent.Set(); } catch { }
+
+                // Shut the write gate here, not after _txLock is acquired: an
+                // in-flight SendFrame holds that lock, and until the gate closes
+                // it can still put a command or poll on the wire that its caller
+                // will be told failed.
+                CloseWireGate();
             }
 
             // Wait for active operations to finish and acquire _txLock to close port.

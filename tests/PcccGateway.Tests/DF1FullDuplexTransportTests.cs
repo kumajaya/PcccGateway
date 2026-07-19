@@ -236,7 +236,17 @@ public class DF1FullDuplexTransportTests
     }
 
     /// <summary>
-    /// Close() wakes a blocking SendFrame promptly.
+    /// Close() wakes a blocking SendFrame promptly, and it reports a closed
+    /// transport rather than a timeout.
+    ///
+    /// The distinction is the point: TimeoutException means the link was up and
+    /// the peer did not answer, so a retry may work. A transport that is closing
+    /// cannot be retried into working, and ITransport now says so.
+    ///
+    /// Asserting InvalidOperationException also removes an ambiguity the earlier
+    /// form had: WaitAsync itself throws TimeoutException on its own deadline, so
+    /// a test expecting TimeoutException passed both when SendFrame threw and when
+    /// it simply never returned. Only the message check told them apart.
     /// </summary>
     [Fact]
     public async Task Close_WakesBlockingSendFrame()
@@ -247,7 +257,8 @@ public class DF1FullDuplexTransportTests
         await WaitForWriteCountAsync(port, 1, 1000);
         transport.Close();
 
-        var ex = await Assert.ThrowsAsync<TimeoutException>(() => sendTask.WaitAsync(TimeSpan.FromMilliseconds(500)));
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => sendTask.WaitAsync(TimeSpan.FromMilliseconds(500)));
         Assert.Contains("closing", ex.Message);
     }
 

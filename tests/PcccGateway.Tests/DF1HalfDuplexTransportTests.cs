@@ -200,6 +200,10 @@ public class DF1HalfDuplexTransportTests
 
     /// <summary>
     /// Poll timeout → no response → SendFrame throws TimeoutException.
+    ///
+    /// This is the case TimeoutException is reserved for: the link was up, the
+    /// command was acknowledged, and the slave then failed to produce a response.
+    /// A retry may well succeed. Contrast with Close_WakesBlockingSendFrame below.
     /// </summary>
     [Fact]
     public async Task PollTimeout_ThrowsTimeoutException()
@@ -227,7 +231,18 @@ public class DF1HalfDuplexTransportTests
     }
 
     /// <summary>
-    /// Close() wakes a blocking SendFrame promptly.
+    /// Close() wakes a blocking SendFrame promptly, and it reports a closed
+    /// transport rather than a timeout.
+    ///
+    /// Contrast with PollTimeout_ThrowsTimeoutException above — that is the whole
+    /// distinction ITransport draws. A timeout means the link was up and the peer
+    /// did not answer, so a retry may work; a closing transport cannot be retried
+    /// into working until it is reopened.
+    ///
+    /// Asserting InvalidOperationException also removes an ambiguity the earlier
+    /// form had: WaitAsync throws TimeoutException on its own deadline, so a test
+    /// expecting TimeoutException passed both when SendFrame threw and when it
+    /// simply never returned. Only the message check told them apart.
     /// </summary>
     [Fact]
     public async Task Close_WakesBlockingSendFrame()
@@ -244,8 +259,8 @@ public class DF1HalfDuplexTransportTests
         // Close the transport while SendFrame is waiting for ACK
         transport.Close();
 
-        // SendFrame should throw TimeoutException promptly
-        var exception = await Assert.ThrowsAsync<TimeoutException>(() => sendTask.WaitAsync(TimeSpan.FromMilliseconds(1000)));
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => sendTask.WaitAsync(TimeSpan.FromMilliseconds(1000)));
         Assert.Contains("closing", exception.Message);
     }
 

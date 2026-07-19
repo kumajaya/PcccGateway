@@ -226,6 +226,28 @@ public abstract class DF1BaseTransport : ITransport
     }
 
     /// <summary>
+    /// Refuses all further writes, without closing the port yet.
+    /// </summary>
+    /// <remarks>
+    /// Teardown must shut this gate BEFORE it waits on the send lock, not after.
+    /// Close() sets its own _closing flag and then blocks on _txLock, which an
+    /// in-flight SendFrame holds for the whole transaction — so between those two
+    /// moments the flag says "closing" while the gate still says "open", and a
+    /// send that was mid-backoff writes its frame anyway. The caller then gets an
+    /// exception and concludes nothing was sent, while the PLC has already acted
+    /// on it. For a forwarded write that is the difference between a lost reply
+    /// and a duplicated command.
+    ///
+    /// Checking the flag again just before the write only narrows that window;
+    /// the gate closes it, because TryWritePort tests and writes under one lock.
+    /// </remarks>
+    protected void CloseWireGate()
+    {
+        lock (_wireLock)
+            _wireClosed = true;
+    }
+
+    /// <summary>
     /// Writes to the serial port under <c>_wireLock</c>. Every port write in
     /// this class hierarchy must go through here: the receive thread writes
     /// link-layer replies while a sender may be writing a data frame, and

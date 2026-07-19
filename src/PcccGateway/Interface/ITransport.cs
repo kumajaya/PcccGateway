@@ -19,10 +19,15 @@
 namespace PcccGateway.Interface;
 
 /// <summary>
-/// Transport abstraction for the PCCC application layer.
+/// Transport abstraction for the PLC-facing backend — the side that reaches
+/// the legacy PLC over DF1 serial, CSPv4, or EtherNet/IP.
+///
 /// A transport is responsible for sending and receiving inner PCCC frames
 /// (PDUs) without any transport‑specific framing (e.g., no DLE stuffing,
 /// no checksum, no CIP encapsulation).
+///
+/// Not to be confused with <see cref="IServerTransport"/>, which is the
+/// client-facing frontend.
 /// </summary>
 /// <remarks>
 /// This interface allows the same PCCC logic to operate over DF1 serial,
@@ -34,6 +39,29 @@ namespace PcccGateway.Interface;
 ///   <item>Waiting for acknowledgments (ACK/NAK, CIP general status)</item>
 ///   <item>Raising <see cref="FrameReceived"/> when a complete, valid inner frame arrives</item>
 /// </list>
+///
+/// <para>
+/// THREADING — <see cref="FrameReceived"/> is NOT raised on a single agreed
+/// thread, and cannot be: the implementations differ by design, not by
+/// oversight.
+/// </para>
+/// <list type="bullet">
+///   <item>
+///     DF1 full-duplex and the TCP transports raise it on a background
+///     receive/executor thread. <see cref="SendFrame"/> returns before the
+///     reply arrives, and the reply is correlated later by TNS.
+///   </item>
+///   <item>
+///     DF1 half-duplex raises it on the caller's own thread, from inside
+///     <see cref="SendFrame"/>, because a half-duplex master transaction is
+///     synchronous: the poll and its response belong to the send. By the time
+///     SendFrame returns, the handler has already run.
+///   </item>
+/// </list>
+/// <para>
+/// A subscriber must therefore be safe on either. It may call back into the
+/// transport, but must not block waiting for further inbound frames.
+/// </para>
 /// </remarks>
 public interface ITransport : IDisposable
 {
@@ -52,13 +80,37 @@ public interface ITransport : IDisposable
     /// The frame must be in the standard PCCC format:
     /// [DST, SRC, CMD, STS, TNS_LO, TNS_HI, FUNC (optional), DATA...].
     /// </summary>
+    /// <remarks>
+    /// The two failure exceptions mean different things and must not be
+    /// conflated. <see cref="TimeoutException"/> says the link was up and the
+    /// exchange did not complete within the configured timeout and retry policy
+    /// — either nothing came back, or the peer answered but never accepted, as
+    /// when it NAKs every attempt. Retrying may work.
+    /// <see cref="InvalidOperationException"/> says this transport is not in a
+    /// state to send at all, and retrying cannot help until it is reopened.
+    /// </remarks>
     /// <param name="innerFrame">Inner PCCC frame (without transport framing).</param>
-    /// <exception cref="TimeoutException">Thrown when no acknowledgment is received within the timeout.</exception>
+    /// <exception cref="TimeoutException">
+    /// Thrown when the exchange does not complete within the configured timeout
+    /// and retry policy — no acknowledgment arrived, or every attempt was NAK'd.
+    /// </exception>
+    /// <exception cref="InvalidOperationException">
+    /// Thrown when the transport is closed, closing, or disposed.
+    /// </exception>
+    /// <exception cref="ArgumentException">
+    /// Thrown when <paramref name="innerFrame"/> is null or too short to carry
+    /// a PCCC frame.
+    /// </exception>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// Thrown when <paramref name="innerFrame"/> is longer than this
+    /// transport's encapsulation can express.
+    /// </exception>
     void SendFrame(byte[] innerFrame);
 
     /// <summary>
     /// Raised when a complete, valid inner frame has been received and
     /// stripped of all transport‑specific framing and checksums.
+    /// See the threading note on the interface itself.
     /// </summary>
     event EventHandler<byte[]> FrameReceived;
 

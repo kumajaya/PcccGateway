@@ -159,7 +159,7 @@ public class DF1FullDuplexTransport : DF1BaseTransport
                 {
                     // Bail out before touching the event or port if a close has begun.
                     if (_closing)
-                        throw new TimeoutException("Send aborted: transport is closing.");
+                        throw new InvalidOperationException("Send aborted: transport is closing.");
 
                     var waiter = new ManualResetEventSlim(false);
                     try
@@ -176,7 +176,7 @@ public class DF1FullDuplexTransport : DF1BaseTransport
                         // Recheck AFTER publishing: Close() may have signalled the
                         // previous waiter between the _closing check above and here.
                         if (_closing)
-                            throw new TimeoutException("Send aborted: transport is closing.");
+                            throw new InvalidOperationException("Send aborted: transport is closing.");
 
                         // SleepDelay is applied before writing (not after receiving ACK).
                         // An earlier revision slept inside the receive-thread lock after ACK — that
@@ -197,12 +197,15 @@ public class DF1FullDuplexTransport : DF1BaseTransport
                     {
                         // The port was disposed mid-cycle. That only happens on shutdown,
                         // so surface it as an aborted send rather than an unexpected type.
-                        throw new TimeoutException("Send aborted: transport is closing.");
+                        // InvalidOperationException, not TimeoutException: nothing timed
+                        // out here, and ITransport reserves TimeoutException for an
+                        // acknowledgment that never arrived.
+                        throw new InvalidOperationException("Send aborted: transport is closing.");
                     }
                     catch (InvalidOperationException) when (_closing)
                     {
                         // WritePort refused because teardown had begun.
-                        throw new TimeoutException("Send aborted: transport is closing.");
+                        throw new InvalidOperationException("Send aborted: transport is closing.");
                     }
                     finally
                     {
@@ -220,7 +223,7 @@ public class DF1FullDuplexTransport : DF1BaseTransport
                     // Shutdown requested while waiting: abandon the send instead of retrying or
                     // waiting out the timeout. Surfaces as a normal send failure to the caller.
                     if (_closing)
-                        throw new TimeoutException("Send aborted: transport is closing.");
+                        throw new InvalidOperationException("Send aborted: transport is closing.");
 
                     if (_ackReceived)
                         return;                     // Success
@@ -631,6 +634,12 @@ public class DF1FullDuplexTransport : DF1BaseTransport
             // design left one shared event signalled to achieve the same thing; per-attempt
             // waiters made that both impossible and unnecessary.)
             _closing = true;
+
+            // Shut the write gate before waiting on _txLock: an in-flight
+            // SendFrame holds that lock, and until the gate closes it can still
+            // put a frame on the wire that its caller will be told failed.
+            CloseWireGate();
+
             lock (_rxLock)
             {
                 SignalWaiter(_currentWaiter);
@@ -660,6 +669,12 @@ public class DF1FullDuplexTransport : DF1BaseTransport
             // while teardown proceeds around it. (Nothing shared is disposed here — see the
             // note further down.)
             _closing = true;
+
+            // Shut the write gate before waiting on _txLock: an in-flight
+            // SendFrame holds that lock, and until the gate closes it can still
+            // put a frame on the wire that its caller will be told failed.
+            CloseWireGate();
+
             lock (_rxLock)
             {
                 SignalWaiter(_currentWaiter);
