@@ -73,6 +73,9 @@ public partial class EIPServerTransport : IServerTransport, IDisposable
     // ── EIP Encapsulation constants ──────────────────────────────────────────
     // These constants eliminate magic numbers throughout the EIP server code.
     private const int EIP_HEADER_LEN = 24;
+
+    /// <summary>Encapsulation options field offset: reserved, must be zero.</summary>
+    private const int EIP_OPTIONS_OFFSET = 20;
     private const int CPF_PREFIX_LEN = 8;      // Interface Handle(4) + Timeout(2) + ItemCount(2)
     private const int NULL_ADDR_ITEM_LEN = 4;   // type(2) + length(2)
     private const int UCD_ITEM_HEADER_LEN = 4;  // type(2) + length(2)
@@ -1111,6 +1114,13 @@ public sealed partial class EIPServerTransport
         // This is an immutable value set at construction.
         private readonly uint _sessionHandle;
 
+        // Rate-limits the unexpected-CIP-path notice to once per connection. A
+        // client that consistently uses 16-bit logical segments is a WORKING
+        // client, so warning per request would bury the one line the notice
+        // exists to surface — 518 of them for a single successful read cycle at
+        // the tag counts this gateway is exercised with.
+        private int _unexpectedPathWarned;
+
         // True after a successful RegisterSession exchange; commands that
         // require a session (Unconnected/Connected Send) are rejected otherwise.
         private bool _isRegistered;
@@ -1247,6 +1257,19 @@ public sealed partial class EIPServerTransport
                         if (await ReadExactAsync(buf, EIP_HEADER_LEN, length, idleFirstByte: false).ConfigureAwait(false) < length)
                             break;
                         Logger.Hex(this, "RX <-client:", buf, EIP_HEADER_LEN + length);
+                    }
+
+                    // Encapsulation options (bytes 20-23) are reserved and must be
+                    // zero; the spec requires the receiver to discard a packet that
+                    // sets them, since a non-zero value asks for behaviour we do not
+                    // implement. Checked after the payload has been consumed so the
+                    // stream stays framed, then the packet alone is dropped rather
+                    // than the session.
+                    uint encapOptions = BitConverter.ToUInt32(buf, EIP_OPTIONS_OFFSET);
+                    if (encapOptions != 0)
+                    {
+                        Logger.Warn(this, $"Dropped EIP request with unsupported options 0x{encapOptions:X8}");
+                        continue;
                     }
 
                     // Dispatch command with the request context.
@@ -2055,18 +2078,41 @@ public sealed partial class EIPServerTransport
                 Logger.Warn(this, "ExtractAndDispatchPCCC: pathSize exceeds buffer - dropping");
                 return;
             }
+
+            // Execute PCCC should address the PCCC Object, class 0x67 instance 1,
+            // which as an 8-bit logical segment pair is 20 67 24 01. Reported, not
+            // rejected: the same object can be addressed with 16-bit logical
+            // segments, and refusing an encoding we simply did not anticipate would
+            // turn a working client into a silent failure. A line in the log is
+            // enough to find it if one ever appears.
+            if (pathBytes != 4 ||
+                buf[offset] != 0x20 || buf[offset + 1] != 0x67 ||
+                buf[offset + 2] != 0x24 || buf[offset + 3] != 0x01)
+            {
+                if (Interlocked.Exchange(ref _unexpectedPathWarned, 1) == 0)
+                {
+                    Logger.Warn(this, "ExtractAndDispatchPCCC: Execute PCCC addressed to an unexpected CIP path - " +
+                                      "handling anyway. Further occurrences on this connection are not logged.");
+                }
+            }
+
             offset += pathBytes;
 
             // ── Request ID ──────────────────────────────────────────────────
-            // requestIdSize includes itself (1 byte) + vendor_id (2) + serial (4) = 7.
-            // Save the entire section into the context for verbatim echo in the response.
+            // Length-prefixed: requestIdSize counts itself (1) + vendor_id (2) +
+            // serial (4) = 7 at minimum, but a client may append further
+            // identifying bytes and the spec allows it. Accept any size at or
+            // above the minimum and echo the whole section back verbatim —
+            // WritePcccReplyHeader writes it length-agnostically.
+            //
+            // Demanding exactly 7 dropped such a request silently. RSLinx and
+            // libplctag both send 7, which is why it never showed up.
             if (offset >= itemEnd || offset >= buf.Length) return;
             byte requestIdSize = buf[offset++];
 
-            // Validate requestIdSize is exactly 7 (the standard size).
-            if (requestIdSize != 7)
+            if (requestIdSize < 7)
             {
-                Logger.Warn(this, $"ExtractAndDispatchPCCC: unexpected requestIdSize {requestIdSize} - dropping");
+                Logger.Warn(this, $"ExtractAndDispatchPCCC: requestIdSize {requestIdSize} below the 7-byte minimum - dropping");
                 return;
             }
 
