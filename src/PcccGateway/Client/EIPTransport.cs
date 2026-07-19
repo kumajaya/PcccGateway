@@ -123,10 +123,12 @@ public class EIPTransport : TCPBaseTransport
 
     protected override int HeaderSize => EipHeaderLen;
 
-    // MaxPayloadLength is inherited: PCCC's own 248-byte content limit is far
-    // below what the encapsulation could carry. For reference, the 16-bit
-    // length field covers CPF(8) + null item(4) + UCD header(4) +
-    // CIP header(13) + (inner - 2), i.e. 27 + inner, allowing inner ≤ 65508.
+    /// <summary>
+    /// The 16-bit encapsulation length covers CPF(8) + null item(4) + UCD
+    /// header(4) + CIP header(13) + (inner - 2), i.e. 27 + inner, so an inner
+    /// frame above 65508 would truncate that field.
+    /// </summary>
+    protected override int MaxPayloadLength => 65508;
 
     // ─── Session management ──────────────────────────────────────────────────
 

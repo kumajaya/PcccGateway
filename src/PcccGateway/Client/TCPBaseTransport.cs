@@ -170,27 +170,30 @@ public abstract class TCPBaseTransport : ITransport
     protected abstract int HeaderSize { get; }
 
     /// <summary>
-    /// Maximum PCCC content, counted from CMD onward. Both CSPv4 and CIP
-    /// Execute PCCC carry the same PCCC vocabulary and the same ceiling:
-    /// 244 data bytes plus CMD, STS and the two TNS bytes.
+    /// Largest inner frame this transport's encapsulation can actually express,
+    /// and nothing more. Derived classes MUST override with the value their own
+    /// 16-bit length field permits, past which it would silently truncate and put
+    /// a malformed packet on the wire.
+    ///
+    /// This is deliberately NOT a PCCC limit. AB publication 1770-6.5.16 caps a
+    /// PCCC message at 244 bytes from FNC to Parameters inclusive, and an earlier
+    /// revision enforced it here — but that is a statement about what a PLC will
+    /// accept, not about what this transport can carry. Judging payloads is the
+    /// PLC's job; a peer that dislikes a frame answers with a PCCC status code,
+    /// which reaches the client and says far more than a gateway-side rejection
+    /// that surfaces to it as an unexplained timeout. The gateway forwards PCCC
+    /// without interpreting it, and a length ceiling is interpretation.
     /// </summary>
-    protected const int MaxPcccContentLength = 248;
+    protected abstract int MaxPayloadLength { get; }
 
     /// <summary>
-    /// Maximum inner-frame length accepted by <see cref="SendFrame"/>:
-    /// DST and SRC plus the PCCC content. Both transports' own encapsulation
-    /// length fields allow far more (65533 for CSP, 65508 for EIP), so PCCC's
-    /// limit is what actually governs.
+    /// Smallest inner frame the packet builders can split without computing a
+    /// negative length: DST and SRC, which both strip before framing the rest.
+    ///
+    /// Structural, like the maximum. A frame of 2..5 bytes carries no usable TNS
+    /// and the peer will reject it, but that is the peer's verdict to give.
     /// </summary>
-    protected virtual int MaxPayloadLength => 2 + MaxPcccContentLength;
-
-    /// <summary>
-    /// Minimum inner-frame length accepted by <see cref="SendFrame"/>:
-    /// DST, SRC, CMD, STS and the two TNS bytes. Both receive paths already
-    /// require the same four PCCC bytes, so anything shorter could only ever
-    /// produce a malformed request on the wire.
-    /// </summary>
-    protected virtual int MinInnerFrameLength => 6;
+    protected virtual int MinInnerFrameLength => 2;
 
     /// <summary>Hostname or IP address of the remote device.</summary>
     protected string Host { get; }
@@ -547,12 +550,13 @@ public abstract class TCPBaseTransport : ITransport
 
         if (innerFrame.Length < MinInnerFrameLength)
             throw new ArgumentException(
-                $"Inner frame must be at least {MinInnerFrameLength} bytes (DST, SRC, CMD, STS, TNS).",
+                $"Inner frame must be at least {MinInnerFrameLength} bytes (DST, SRC).",
                 nameof(innerFrame));
 
         if (innerFrame.Length > MaxPayloadLength)
             throw new ArgumentOutOfRangeException(nameof(innerFrame),
-                $"Inner frame exceeds the maximum payload length of {MaxPayloadLength} bytes.");
+                $"Inner frame of {innerFrame.Length} bytes exceeds what this encapsulation " +
+                $"can express ({MaxPayloadLength} bytes); the length field would truncate.");
 
         byte[]? sentPacket = null;
         uint generation = 0;
@@ -740,17 +744,13 @@ public abstract class TCPBaseTransport : ITransport
             byte[]? inner = ExtractInnerFrame(header, payload, dataLen);
             if (inner == null) return;
 
-            // The size contract SendFrame enforces applies inbound too: a reply
-            // carries the same PCCC vocabulary and the same ceiling. Logged
-            // rather than dropped quietly — outbound violations surface as an
-            // exception to the caller, but an inbound one would show up only as
-            // a request that never completes, which is far harder to trace.
-            if (inner.Length < MinInnerFrameLength || inner.Length > MaxPayloadLength)
-            {
-                Logger.Warn(this, $"{GetType().Name}: discarding inner frame of {inner.Length} bytes " +
-                                  $"(outside {MinInnerFrameLength}..{MaxPayloadLength})");
-                return;
-            }
+            // No length judgement on the inbound path, deliberately. An earlier
+            // revision discarded a reply outside the outbound size contract, which
+            // meant a peer answering with slightly more than we expected had its
+            // reply swallowed here and the client saw a request that never
+            // completed. Whatever the peer sent is what the client asked for; the
+            // extractor has already bounded every read against the declared
+            // lengths, so passing it on cannot corrupt anything downstream.
 
             // A RawFrameReceived handler may have closed the transport, or
             // closed and reopened it. Delivering this packet now would hand a

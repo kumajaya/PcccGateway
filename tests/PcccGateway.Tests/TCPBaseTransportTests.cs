@@ -18,11 +18,13 @@ public class TCPBaseTransportTests
 {
     private const int SignalTimeoutMs = 3000;
 
-    // Mirrors TCPBaseTransport.MaxPayloadLength (2 + MaxPcccContentLength).
-    // Duplicated because the member is protected; if the base changes, the
-    // boundary tests below should be updated with it.
-    private const int MaxInnerFrameLength = 250;
-    private const int MinInnerFrameLength = 6;
+    // Structural limits, mirrored here because the members are protected. These
+    // are what each encapsulation's 16-bit length field can express — NOT a PCCC
+    // content limit. The transports deliberately impose none: judging whether a
+    // payload is acceptable belongs to the PLC, which answers with a status code.
+    private const int EipMaxInnerFrame = 65508;   // 16-bit length covers 27 + inner
+    private const int CspMaxInnerFrame = 65533;   // 16-bit data_length covers inner + 2
+    private const int MinInnerFrame = 2;          // DST + SRC, what the builders split
 
     private static int GetFreePort()
     {
@@ -201,31 +203,64 @@ public class TCPBaseTransportTests
 
     [Theory]
     [InlineData(0)]
-    [InlineData(1)]
-    [InlineData(MinInnerFrameLength - 1)]
-    public void SendFrame_TooShort_Throws(int length)
+    [InlineData(MinInnerFrame - 1)]
+    public void SendFrame_BelowTheStructuralMinimum_Throws(int length)
     {
+        // Under two bytes the packet builders cannot split DST/SRC off without
+        // computing a negative payload length.
         using var transport = new EIPTransport("127.0.0.1", 44818);
         Assert.Throws<ArgumentException>(() => transport.SendFrame(new byte[length]));
     }
 
-    [Fact]
-    public void SendFrame_TooLong_Throws()
+    [Theory]
+    [InlineData("eip", EipMaxInnerFrame + 1)]
+    [InlineData("csp", CspMaxInnerFrame + 1)]
+    public void SendFrame_AboveTheEncapsulationMaximum_Throws(string protocol, int length)
     {
-        using var transport = new EIPTransport("127.0.0.1", 44818);
-        Assert.Throws<ArgumentOutOfRangeException>(
-            () => transport.SendFrame(new byte[MaxInnerFrameLength + 1]));
+        // One past the largest inner frame the 16-bit length field can hold.
+        // Beyond it the field wraps and the packet on the wire is malformed —
+        // a mechanical failure, not a protocol opinion.
+        using ITransport transport = Create(protocol, 44818);
+        Assert.Throws<ArgumentOutOfRangeException>(() => transport.SendFrame(new byte[length]));
     }
 
     [Theory]
-    [InlineData(MinInnerFrameLength)]
-    [InlineData(MaxInnerFrameLength)]
-    public async Task SendFrame_AtLengthBoundary_IsAccepted(int length)
+    [InlineData("eip", EipMaxInnerFrame)]
+    [InlineData("csp", CspMaxInnerFrame)]
+    public void SendFrame_AtTheEncapsulationMaximum_IsAccepted(string protocol, int length)
     {
+        // Pins the exact ceiling from below. Without this, the rejection tests
+        // above would stay green if a limit were accidentally lowered — they only
+        // prove that SOME value is rejected, not which. Accepted by validation, so
+        // the failure that surfaces is the closed transport.
+        using ITransport transport = Create(protocol, 44818);
+        Assert.Throws<InvalidOperationException>(() => transport.SendFrame(new byte[length]));
+    }
+
+    [Fact]
+    public void SendFrame_PastTheFormerPcccCeiling_IsAccepted()
+    {
+        // 251 bytes was rejected by a PCCC content limit this transport no longer
+        // imposes. Validation now passes it, so the failure that surfaces is the
+        // closed transport — which is what proves the length check is gone.
+        using var transport = new EIPTransport("127.0.0.1", 44818);
+        Assert.Throws<InvalidOperationException>(() => transport.SendFrame(new byte[251]));
+    }
+
+    [Theory]
+    [InlineData(6)]
+    [InlineData(250)]
+    [InlineData(512)]
+    public async Task SendFrame_SurvivesTheEncapsulation_AtVariousSizes(int length)
+    {
+        // 512 is the one that matters: both the outbound check and the inbound
+        // discard used to reject it, so a frame this size could not previously
+        // complete a round trip in either direction.
+        //
         // Sent to a live device rather than asserting "transport is not open" on a
         // closed one. That earlier form passed only because validation happens to
         // run before the open check: reordering the two would have kept it green
-        // while it quietly stopped testing the boundary at all.
+        // while it quietly stopped testing anything.
         int port = GetFreePort();
         using var device = new FakeDevice(port);
         device.Start();
@@ -236,7 +271,7 @@ public class TCPBaseTransportTests
 
         byte[] frame = InnerFrame();
         Array.Resize(ref frame, length);
-        for (int i = MinInnerFrameLength; i < length; i++)
+        for (int i = 6; i < length; i++)
             frame[i] = (byte)i;   // distinct payload, so a truncated round trip shows up
 
         transport.Open();

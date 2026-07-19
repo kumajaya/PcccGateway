@@ -166,10 +166,11 @@ public class CSPTransport : TCPBaseTransport
 
     protected override int HeaderSize => CSPHeaderLen;
 
-    // MaxPayloadLength is inherited: PCCC's own 248-byte content limit is far
-    // below what the encapsulation could carry. For reference, data_length is
-    // 16-bit and covers LSAP(4) + PCCC(inner - 2) = inner + 2, allowing
-    // inner ≤ 65533.
+    /// <summary>
+    /// data_length is 16 bits and covers LSAP(4) + PCCC(inner - 2) = inner + 2,
+    /// so an inner frame above 65533 would truncate that field.
+    /// </summary>
+    protected override int MaxPayloadLength => 65533;
 
     // ─── Session management ──────────────────────────────────────────────────
 
