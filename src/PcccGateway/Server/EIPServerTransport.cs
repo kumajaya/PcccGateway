@@ -39,9 +39,11 @@ namespace PcccGateway.Server;
 ///          → HandleCommand()
 ///          → HandleUnconnectedSend() or HandleConnectedSend()
 ///          → ExtractAndDispatchPCCC()
-///          → ILinkTransport.PduReceived event  (raises PCCCEngine.OnPduReceived)
-///          → PCCCEngine.DispatchCommand()     (reads/writes PlcMemory)
-///          → ILinkTransport.SendResponse()      (routes back to originating client)
+///          → IServerTransport.PduReceived event  (raises Gateway.OnEipPduReceived)
+///          → Gateway forwards the PDU verbatim to the PLC-side transport,
+///            and routes the PLC's reply back by TNS — it does not interpret
+///            the PCCC payload
+///          → IServerTransport.SendResponse()     (routes back to originating client)
 ///          → EIPClient.SendSerializedAsync()   (serialized per-client send queue)
 ///          → SendUnconnectedResponse() or SendConnectedResponse()
 ///          → TCP TX
@@ -56,7 +58,7 @@ namespace PcccGateway.Server;
 ///      full six-field CPF layout.
 ///   3. RegisterSession must validate Transport Version; return status 0x00000001
 ///      for unsupported versions.
-///   4. A UDP listener on port 44818 answers broadcast ListIdentity so the emulator
+///   4. A UDP listener on port 44818 answers broadcast ListIdentity so the gateway
 ///      appears in RSLinx "Browse Network" without a manual IP entry.
 ///   5. Response ordering per client is guaranteed by a per-client SemaphoreSlim
 ///      inside EIPClient.SendSerializedAsync(), preventing interleaved responses
@@ -231,7 +233,7 @@ public partial class EIPServerTransport : IServerTransport, IDisposable
     private const ushort VENDOR_ID            = 0xF33D;     // "tres"
     private const uint   VENDOR_SERIAL_NUMBER = 0x21504345; // "!PCE" (ASCII)
 
-    // ── ILinkTransport ────────────────────────────────────────────────────────
+    // ── IServerTransport ──────────────────────────────────────────────────────
 
     /// <summary>Product name string used in log messages.</summary>
     // Current product name, updated on identity discovery (starts at the fallback).
@@ -259,7 +261,7 @@ public partial class EIPServerTransport : IServerTransport, IDisposable
 
     public const int EIP_DEFAULT_PORT = 44818;
 
-    // ── ILinkTransport: Start / Stop ──────────────────────────────────────────
+    // ── IServerTransport: Start / Stop ────────────────────────────────────────
 
     public void Start()
     {
@@ -273,7 +275,7 @@ public partial class EIPServerTransport : IServerTransport, IDisposable
         _listener.Start();
         _acceptLoopTask = Task.Run(AcceptClientsAsync, _cts.Token);
 
-        // UDP listener — answers broadcast ListIdentity so the emulator is
+        // UDP listener — answers broadcast ListIdentity so the gateway is
         // visible in RSLinx "Browse Network" without a manual IP entry.
         try
         {
@@ -382,7 +384,7 @@ public partial class EIPServerTransport : IServerTransport, IDisposable
     }
 
     /// <summary>
-    /// Synchronous Stop() for ILinkTransport compatibility.
+    /// Synchronous Stop() for IServerTransport compatibility.
     /// Blocks until all in-flight requests are drained or the 3-second
     /// timeout expires.
     /// </summary>
@@ -411,7 +413,7 @@ public partial class EIPServerTransport : IServerTransport, IDisposable
         GC.SuppressFinalize(this);
     }
 
-    // ── ILinkTransport: SendResponse ──────────────────────────────────────────
+    // ── IServerTransport: SendResponse ────────────────────────────────────────
 
     /// <summary>
     /// Routes a PCCC response PDU back to the client that raised
@@ -604,7 +606,7 @@ public partial class EIPServerTransport : IServerTransport, IDisposable
     /// <summary>
     /// Listens for UDP broadcast <c>ListIdentity</c> (0x0063) packets on port
     /// 44818 and sends a unicast reply to the originating host.  This is what
-    /// makes the emulator appear in the RSLinx "Browse Network" tree without
+    /// makes the gateway appear in the RSLinx "Browse Network" tree without
     /// requiring the operator to type the IP address manually.
     /// </summary>
     private async Task HandleUdpBroadcastAsync()
@@ -952,7 +954,7 @@ public partial class EIPServerTransport : IServerTransport, IDisposable
 }
 
 /// <summary>
-/// EtherNet/IP (EIP) transport implementation for PCCC emulator.
+/// EtherNet/IP (EIP) server transport: the gateway's client-facing frontend.
 /// Handles TCP connections, session management, and CIP messaging.
 ///
 /// This file contains the EIPClient nested class which manages individual
@@ -2038,7 +2040,7 @@ public sealed partial class EIPServerTransport
         /// builds a PCCC-style PDU, saves the Request ID bytes into the context
         /// for response echoing, and raises <see cref="PduReceived"/>.
         /// <para>
-        /// PDU layout expected by <c>PCCCEngine.DispatchCommand</c>:
+        /// PDU layout handed to <c>Gateway.OnEipPduReceived</c>:
         ///   [DST, SRC, CMD, STS, TNS_LO, TNS_HI, FUNC?, DATA...]
         /// </para>
         /// <para>
@@ -2146,7 +2148,7 @@ public sealed partial class EIPServerTransport
             int  pduLen  = 6 + (hasFunc ? 1 : 0) + remaining;
             var  pdu     = new byte[pduLen];
 
-            pdu[0] = 0x01;   // DST — emulator node
+            pdu[0] = 0x01;   // DST — this gateway's node
             pdu[1] = 0x01;   // SRC — client node
             pdu[2] = pcccCmd;
             pdu[3] = pcccSts;
@@ -2180,7 +2182,7 @@ public sealed partial class EIPServerTransport
         /// Exceptions from the send path are caught and logged here so the caller
         /// (EIPTransport.SendResponse) can safely fire-and-forget this task.
         /// </summary>
-        /// <param name="pdu">PDU to send (built by PCCCEngine)</param>
+        /// <param name="pdu">PDU to send (the PLC's reply, routed back by Gateway)</param>
         /// <param name="context">Request context containing SenderContext and RequestId</param>
         public async Task SendSerializedAsync(byte[] pdu, EIPRequestContext context)
         {
@@ -2208,7 +2210,7 @@ public sealed partial class EIPServerTransport
         /// Called exclusively from <see cref="SendSerializedAsync"/> which
         /// holds _sendLock for the duration of this call.
         /// </summary>
-        /// <param name="pdu">PDU to send (built by PCCCEngine)</param>
+        /// <param name="pdu">PDU to send (the PLC's reply, routed back by Gateway)</param>
         /// <param name="context">Request context containing SenderContext and RequestId</param>
         private async Task SendResponseAsync(byte[] pdu, EIPRequestContext context)
         {
@@ -2243,9 +2245,9 @@ public sealed partial class EIPServerTransport
 
             WritePcccReplyHeader(w, pdu, context.RequestId);
 
-            // Data payload — response PDU layout from PCCCEngine:
+            // Data payload — reply PDU layout as routed back by Gateway:
             //   [DST, SRC, CMD, STS, TNS_LO, TNS_HI, DATA...]
-            // Data bytes start at offset 6 (no FUNC byte in PCCCEngine data responses).
+            // Data bytes start at offset 6; the PLC's reply carries no FUNC byte.
             const int dataOffset = 6;
             if (pdu.Length > dataOffset)
                 w.Write(pdu, dataOffset, pdu.Length - dataOffset);
