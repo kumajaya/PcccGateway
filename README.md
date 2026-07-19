@@ -42,18 +42,19 @@ flowchart LR
   the CIP Execute PCCC (0x4B) path. Answers broadcast ListIdentity so it appears in RSLinx
   "Browse Network" automatically.
 - `Client/` — the PLC-side transports, all implementing `ITransport`:
-  `DF1FullDuplexTransport`, `DF1HalfDuplexTransport`, `CSPTransport`, `EIPTransport`,
-  plus `SerialPortWrapper`.
+  `DF1FullDuplexTransport` and `DF1HalfDuplexTransport` over `DF1BaseTransport`,
+  `CSPTransport` and `EIPTransport` over `TCPBaseTransport`, plus `SerialPortWrapper`.
 - `PcccGateway.cs` — the core `Gateway`: wires the server's `PduReceived` to the PLC transport's
   `SendFrame`, and the PLC transport's `FrameReceived` back to the originating client. It
   allocates a gateway-unique TNS per outstanding request and restores the client's original TNS
   on the reply, so a single PLC link can safely serve many clients.
 - `Common/` — `Logger`, `RingBuffer`, `CheckSumOptions`.
-- `Interface/` — `ITransport`, `IServerTransport`, `ISerialPort`.
+- `Interface/` — `ITransport` (PLC-facing backend), `IServerTransport` (client-facing frontend),
+  `ISerialPort`.
 
 ## Features
 
-- ✅ Transparent PCCC forwarding — no address parsing or data conversion
+- ✅ Transparent PCCC forwarding — no address parsing, data conversion, or payload size opinions
 - ✅ Full EIP server implementation (RegisterSession, ListIdentity, Forward Open, Connected/Unconnected Send)
 - ✅ DF1 Full-Duplex (RS-232) with ACK/NAK, ENQ, CRC/BCC
 - ✅ DF1 Half-Duplex Master (RS-485) with multi-drop addressing and echo suppression
@@ -87,7 +88,7 @@ flowchart LR
 PcccGateway/
 ├── PcccGateway.sln            solution (main project + tests)
 ├── src/PcccGateway/           the gateway (Client/ Common/ Interface/ Server/)
-└── tests/PcccGateway.Tests/   xUnit unit tests (70+ tests)
+└── tests/PcccGateway.Tests/   xUnit unit tests (150+ tests)
 ```
 
 ## Building
@@ -102,14 +103,20 @@ dotnet build -c Release        # builds the whole solution
 dotnet test                    # runs the xUnit suite (no hardware required)
 ```
 
-The test suite includes 70+ tests covering:
+The test suite includes 150+ tests covering:
 - DF1 full-duplex and half-duplex framing, checksum, ACK/NAK/ENQ, retry/backoff,
   timeout, echo suppression, partial frame timeout, buffer overflow, and shutdown
+- DF1 callback re-entrancy — a handler may send from inside a receive callback, and may
+  close the transport from one, without deadlocking
 - EIP server boundary conditions and buffer overflow protection
-- Gateway TNS correlation, eviction, and circuit breaker
-- Transport lifecycle (Open/Close/Open cycles) and lifecycle token cancellation
+- TCP transport session lifecycle: generation-guarded teardown, subscriber exception
+  isolation, event ordering, Close/Dispose called from inside a handler, and the
+  encapsulation size limits of each protocol
+- SerialPortWrapper session lifecycle: chunk ordering, stale chunks dropped across a
+  reopen, and teardown that cannot publish over a half-closed session
+- Gateway TNS correlation and eviction
+- Transport lifecycle (Open/Close/Open cycles) and reconnect behaviour
 - Gateway end-to-end forwarding with TNS correlation (real TCP socket)
-- SerialPortWrapper channel-based byte ordering and dispatch
 - Asynchronous logging with bounded queue and forced log behavior
 - Identity resolver (PLC-5, SLC, MicroLogix), checksum, DLE stuffing, and ring buffer
 - All tests are async (no xUnit1031 warnings) and run serially to avoid static Logger interference
@@ -135,6 +142,11 @@ dotnet run -c Release -- --mode eip --host 192.168.1.10
 ```
 
 ### Options
+
+The **Applies to** column is enforced, not advisory: an option the selected `--mode` does not
+read is rejected with an error rather than accepted and ignored. `--mode csp --baud 9600` does
+not start. Invalid values are rejected too — a mistyped number no longer leaves the default
+quietly in place.
 
 | Option | Applies to | Description | Default |
 |---|---|---|---|
@@ -162,21 +174,38 @@ Point your EIP client at the machine running the gateway (e.g. add its IP in RSL
 
 ## Configuration notes
 
-- **DF1 checksum** — CRC-16 (default) or BCC, selectable via `DF1BaseTransport.ChecksumType`.
-- **DF1 half-duplex** — set `SlaveAddress` (1–254); the gateway writes it into the command
-  frame's DST byte automatically. RS-485 direction control is `Auto` / `Rts` / `Dtr`, with
-  configurable assert/deassert timing and optional echo suppression for adapters that loop TX
-  back onto RX.
+- **DF1 checksum** — CRC-16 (default) or BCC, via `--checksum`.
+- **DF1 half-duplex** — set the slave node with `--target` (1–254); the gateway writes it into
+  the command frame's DST byte automatically. RS-485 direction control is `--rs485-mode`
+  `auto` / `rts` / `dtr`, with configurable assert/deassert timing and optional echo
+  suppression for adapters that loop TX back onto RX.
 - **CSPv4** — the LSAP control byte defaults to `0x00`; some targets (e.g. certain RSLinx
-  configurations) expect `0x05`. Override it in the `CSPTransport` constructor.
+  configurations) expect `0x05`. Set it with `--lsap-control 05`.
+- **Logging cost** — `--quiet` is not a minor optimisation. Diagnostic logging formats and
+  writes a line per PDU, which dominates throughput for clients that issue many small
+  requests. Leave it on while commissioning, turn it off in production.
+- **Shutdown** — Ctrl+C drains the transports fully. SIGTERM and `docker stop` run under the
+  runtime's ProcessExit budget of roughly two seconds, which may cut that drain short. The
+  drains are best-effort, so nothing is corrupted either way.
 
 ## Status & limitations
 
 Verified against RSLinx OPC Server and PCCCEmulator for read/write (int, float, string, bit),
-multi-element, mode switching, memory init, and read-modify-write.
+multi-element, mode switching, memory init, and read-modify-write. RSLinx Browse and Data
+Monitor exercise the ListIdentity, Forward Open, Connected Send and Forward Close paths.
+
+Cross-checked against **libplctag** reading the same 523-tag address list through each PLC-side
+transport in turn — DF1, CSPv4 and EtherNet/IP — with identical values in all three. That the
+result does not depend on which backend carried it is the practical test of the transparency
+claim above.
 
 - **Routed LSAP (DH+ / DH-485) is not implemented** — only the local/direct form is supported.
   Deployments that bridge onto a DH+ or DH-485 segment are out of scope for now.
+- **Get Attribute Single** on the Identity Object answers CIP status 0x08 (service not
+  supported). Clients use Get Attributes All, which is implemented.
+- **RS-485 de-assert timing** is a heuristic derived from baud rate and frame length. It has
+  only ever run against virtual serial ports, where RTS does nothing. Validate it on the real
+  adapter before trusting it, and raise `--rs485-deassert-delay` if frames come back truncated.
 
 ## License
 
