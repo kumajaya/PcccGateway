@@ -19,8 +19,15 @@
 namespace PcccGateway.Interface;
 
 /// <summary>
-/// Transport abstraction for PCCC emulator link layer implementations.
-/// Supports DF1 Full-Duplex (serial), EtherNet/IP (EIP/PCCC), and future DH485.
+/// Transport abstraction for the gateway's CLIENT-FACING frontend — the side
+/// that EIP clients such as RSLinx, libplctag and pycomm3 connect to.
+///
+/// Not to be confused with <see cref="ITransport"/>, which is the PLC-facing
+/// backend. A PDU arriving on an IServerTransport is forwarded out through an
+/// ITransport, and the PLC's reply travels back the same way in reverse.
+///
+/// EIPServerTransport is the only implementation: the frontend is always an
+/// EtherNet/IP server, whichever backend --mode selects.
 /// </summary>
 public interface IServerTransport
 {
@@ -45,7 +52,12 @@ public interface IServerTransport
 
     /// <summary>
     /// Raised when a complete PDU (inner frame) has been received and parsed.
-    /// The handler should dispatch the command to PlcMemory.
+    ///
+    /// The handler forwards the PDU to the PLC-side transport unchanged, and
+    /// later routes the PLC's reply back through <see cref="SendResponse"/>
+    /// using the <c>ClientContext</c> carried here. It does NOT interpret the
+    /// PCCC payload — deciding what a command means is the PLC's job, and the
+    /// gateway's transparency depends on it staying that way.
     /// </summary>
     event EventHandler<(byte[] pdu, object ClientContext)> PduReceived;
 
