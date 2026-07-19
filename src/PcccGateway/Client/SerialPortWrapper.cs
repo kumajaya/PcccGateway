@@ -138,7 +138,6 @@ public class SerialPortWrapper : ISerialPort
 
     public int BaudRate => _port.BaudRate;
     public Parity Parity => _port.Parity;
-    public int BytesToRead => _port.BytesToRead;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="SerialPortWrapper"/> class
@@ -374,25 +373,6 @@ public class SerialPortWrapper : ISerialPort
         }
     }
 
-    public int Read(byte[] buffer, int offset, int count)
-    {
-        lock (_sync)
-        {
-            if (_disposed || _disposing)
-                throw new ObjectDisposedException(nameof(SerialPortWrapper));
-
-            // Close() clears _open before parking in Monitor.Wait precisely so no
-            // new I/O starts against a session that is ending. Write() already
-            // honours that; without the same check here a read could consume the
-            // ending session's bytes, or block shutdown for the full ReadTimeout
-            // while holding _sync.
-            if (!_open || !_port.IsOpen)
-                return 0;
-
-            return _port.Read(buffer, offset, count);
-        }
-    }
-
     public void Dispose()
     {
         Exception? disposeError = null;
@@ -478,7 +458,6 @@ public class SerialPortWrapper : ISerialPort
         public bool IsOpen => _port.IsOpen;
         public int BaudRate => _port.BaudRate;
         public Parity Parity => _port.Parity;
-        public int BytesToRead => _port.BytesToRead;
 
         public bool RtsEnable
         {
@@ -526,7 +505,6 @@ public class SerialPortWrapper : ISerialPort
         public void Open() => _port.Open();
         public void Close() => _port.Close();
         public void Write(byte[] buffer, int offset, int count) => _port.Write(buffer, offset, count);
-        public int Read(byte[] buffer, int offset, int count) => _port.Read(buffer, offset, count);
         public void Dispose() => _port.Dispose();
     }
 }

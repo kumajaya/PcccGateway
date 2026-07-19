@@ -15,8 +15,6 @@ namespace PcccGateway.Tests;
 internal sealed class FakeSerialPort : ISerialPort
 {
     private bool _isOpen;
-    private readonly object _readLock = new object();
-    private readonly Queue<byte> _readBuffer = new Queue<byte>();
 
     public event EventHandler<byte[]>? BytesReceived;
 
@@ -25,18 +23,6 @@ internal sealed class FakeSerialPort : ISerialPort
     public bool DtrEnable { get; set; }
     public int BaudRate { get; set; } = 19200;
     public Parity Parity { get; set; } = Parity.None;
-
-    /// <summary>
-    /// Number of bytes available in the simulated read buffer.
-    /// </summary>
-    public int BytesToRead
-    {
-        get
-        {
-            lock (_readLock)
-                return _readBuffer.Count;
-        }
-    }
 
     /// <summary>
     /// Every frame handed to <see cref="Write"/>, in write order.
@@ -58,29 +44,20 @@ internal sealed class FakeSerialPort : ISerialPort
         WrittenFrames.Enqueue(copy);
     }
 
-    /// <summary>Simulates bytes arriving from the remote peer in a single chunk.</summary>
+    /// <summary>
+    /// Simulates bytes arriving from the remote peer in a single chunk.
+    /// </summary>
+    /// <remarks>
+    /// This used to also enqueue the bytes into a private buffer so a later
+    /// Read() could return them. Nothing ever called Read — the gateway's
+    /// receive path is entirely event-driven — so that buffer, its lock, and
+    /// the enqueue loop went with Read when it left ISerialPort. The fake now
+    /// keeps one representation of what arrived instead of two, only one of
+    /// which was ever observed.
+    /// </remarks>
     public void SimulateReceive(params byte[] data)
     {
-        // Add to the read buffer so Read() can retrieve them.
-        lock (_readLock)
-        {
-            foreach (byte b in data)
-                _readBuffer.Enqueue(b);
-        }
-        // Trigger the BytesReceived event with the chunk.
         BytesReceived?.Invoke(this, data);
-    }
-
-    /// <summary>Reads bytes from the simulated buffer.</summary>
-    public int Read(byte[] buffer, int offset, int count)
-    {
-        lock (_readLock)
-        {
-            int toRead = Math.Min(count, _readBuffer.Count);
-            for (int i = 0; i < toRead; i++)
-                buffer[offset + i] = _readBuffer.Dequeue();
-            return toRead;
-        }
     }
 
     /// <summary>Returns the frame at the specified index, or null if out of range.</summary>
