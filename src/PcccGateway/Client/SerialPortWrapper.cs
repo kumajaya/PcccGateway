@@ -43,9 +43,9 @@ namespace PcccGateway.Client;
 ///     dropped by the callback loop instead of being delivered late.
 ///   </item>
 ///   <item>
-///     All lifecycle and I/O state (<c>_open</c>, <c>_disposed</c>,
-///     <c>_generation</c>) is guarded by <c>_sync</c>. Operations are rejected
-///     once disposal begins.
+///     All lifecycle and I/O state (<c>_open</c>, <c>_closing</c>,
+///     <c>_disposed</c>, <c>_generation</c>) is guarded by <c>_sync</c>.
+///     Operations are rejected once disposal begins.
 ///   </item>
 /// </list>
 /// </summary>
@@ -78,14 +78,17 @@ public class SerialPortWrapper : ISerialPort
     // Secondary channel that moves callback invocation off the channel-draining
     // loop, so a slow subscriber cannot stall the reader.
     //
-    // NOTE: this does NOT break the SendFrame-from-BytesReceived deadlock, and an
-    // earlier revision of this comment wrongly claimed that it did. The DF1
-    // transports parse inbound bytes inside their BytesReceived handler, which
-    // runs ON this consumer — so parsing and callback are still the same thread.
-    // A handler that blocks waiting for an ACK is therefore waiting for bytes only
-    // it could parse. See the remarks on BytesReceived; breaking the cycle needs a
-    // separate serialized executor for public transport callbacks, leaving this
-    // consumer responsible for parsing alone.
+    // NOTE: this does NOT by itself break the SendFrame-from-BytesReceived
+    // deadlock, and an earlier revision of this comment wrongly claimed that it
+    // did. The DF1 transports parse inbound bytes inside their BytesReceived
+    // handler, which runs ON this consumer — parsing and callback are the same
+    // thread here.
+    //
+    // What breaks the cycle lives one layer up: DF1BaseTransport owns a callback
+    // executor and posts its public receive-path events to it, so a subscriber
+    // that calls SendFrame() runs on that executor while this consumer stays free
+    // to parse the ACK it waits for. This consumer is responsible for parsing
+    // alone.
     private readonly Channel<(int gen, byte[] data)> _callbackChannel = Channel.CreateBounded<(int, byte[])>(
         new BoundedChannelOptions(100)
         {
@@ -140,13 +143,16 @@ public class SerialPortWrapper : ISerialPort
     /// </summary>
     /// <remarks>
     /// KNOWN LIMITATION — re-entrancy: handlers run on the one callback consumer
-    /// thread. A handler that BLOCKS waiting for more inbound bytes — most
-    /// notably a DF1 <c>SendFrame()</c> that waits for an ACK — will deadlock,
-    /// because the bytes it is waiting for can only be parsed by this same
-    /// consumer once the handler returns. Handlers must therefore be
-    /// non-blocking; offload any call that waits on further I/O to another
-    /// thread. (Tracked for a dedicated per-transport callback executor; to be
-    /// verified with the PcccGateway test harness.)
+    /// thread, which is also the only thread that parses inbound bytes. A handler
+    /// that BLOCKS waiting for more of those bytes deadlocks, because what it
+    /// waits for can only be parsed once it returns. Handlers must be
+    /// non-blocking; offload anything that waits on further I/O to another thread.
+    ///
+    /// The DF1 transports can no longer hit this. Their handler here only parses
+    /// and queues, and their own public events are raised on DF1BaseTransport's
+    /// callback executor — so a subscriber calling <c>SendFrame()</c> and waiting
+    /// for an ACK is not standing on this consumer. The limitation still binds any
+    /// other direct subscriber.
     /// </remarks>
     public event EventHandler<byte[]>? BytesReceived;
 

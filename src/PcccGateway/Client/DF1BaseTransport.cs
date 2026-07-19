@@ -16,6 +16,7 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
+using System.Threading.Channels;
 using PcccGateway.Common;
 using PcccGateway.Interface;
 
@@ -24,8 +25,28 @@ namespace PcccGateway.Client;
 /// <inheritdoc cref="ITransport"/>
 /// <summary>
 /// Abstract base class for DF1 transport implementations (full‑duplex and half‑duplex master).
-/// Provides common DF1 framing services: DLE stuffing, checksum calculation, control byte
-/// transmission, and raw frame events. Derived classes must implement <see cref="SendFrame"/>.
+/// Derived classes must implement <see cref="SendFrame"/>.
+///
+/// <para>Provides three things, of which only the first is about framing:</para>
+/// <list type="number">
+///   <item>
+///     DF1 framing services — DLE stuffing, CRC/BCC checksums, control-byte
+///     transmission, and the raw/decoded frame events.
+///   </item>
+///   <item>
+///     A single write gate: every port write in this hierarchy goes through
+///     <see cref="TryWritePort"/> under <c>_wireLock</c>, because the receive
+///     thread writes link-layer replies while a sender may be writing a data
+///     frame and <see cref="ISerialPort.Write"/> promises no thread safety. The
+///     gate also refuses writes once teardown has begun.
+///   </item>
+///   <item>
+///     A callback executor owned for the lifetime of the transport. Receive-path
+///     events are posted to it instead of raised inline; see the executor notes
+///     below for why, and for which events deliberately bypass it.
+///     <see cref="Dispose"/> drains it.
+///   </item>
+/// </list>
 /// </summary>
 public abstract class DF1BaseTransport : ITransport
 {
@@ -46,6 +67,59 @@ public abstract class DF1BaseTransport : ITransport
     // --- Common fields ---
     /// <summary>Serial port abstraction.</summary>
     protected readonly ISerialPort _port;
+
+    /// <summary>
+    /// Serialises EVERY write to the serial port. Deliberately not _txLock: a
+    /// full-duplex SendFrame holds _txLock while awaiting an ACK that the
+    /// receive thread has to write, so reusing _txLock here would deadlock.
+    /// Held only for the duration of one write, never across a wait.
+    /// </summary>
+    protected readonly object _wireLock = new object();
+
+    /// <summary>
+    /// True whenever writes must be refused: before the first <see cref="Open"/>,
+    /// and again once teardown has begun. Starts true deliberately — a transport
+    /// that was never opened must not put bytes on a port. Guarded by _wireLock.
+    /// </summary>
+    private bool _wireClosed = true;
+
+    // ─── Public-callback executor ────────────────────────────────────────────
+    //
+    // Events raised from the RECEIVE path go through here instead of being
+    // invoked inline. Inline, they run on the serial callback thread — which is
+    // also the only thread that can parse inbound bytes — so a handler that
+    // calls SendFrame() waits for an ACK that nobody is left to parse, and the
+    // send fails with a timeout every single time.
+    //
+    // Events raised from the CALLER's thread (half-duplex FrameReceived and
+    // RawFrameSent, which fire after SendFrame has released _txLock) keep their
+    // direct invocation: there is no starvation to avoid there, and queuing them
+    // would change the contract that SendFrame has delivered the response by the
+    // time it returns.
+    //
+    // Unbounded on purpose. Bounded-with-blocking would recreate the very
+    // deadlock this removes — a full queue would stall the parser, and the
+    // handler waiting on it would never get its ACK. Bounded-with-drop is not an
+    // option either, since this queue carries FrameReceived, whose loss is
+    // functional rather than diagnostic. A permanently stuck handler therefore
+    // accumulates memory; handlers are expected to return promptly.
+    private enum CallbackKind { Frame, RawSent, RawReceived }
+
+    private readonly Channel<(CallbackKind kind, byte[] data)> _callbacks =
+        Channel.CreateUnbounded<(CallbackKind, byte[])>(new UnboundedChannelOptions
+        {
+            SingleReader = true,
+            SingleWriter = false,   // the receive path and (later) others may post
+            AllowSynchronousContinuations = false
+        });
+
+    private readonly Task _callbackPump;
+
+    /// <summary>True on the executor thread, so teardown never waits on itself.</summary>
+    private readonly ThreadLocal<bool> _onCallbackThread = new();
+
+    /// <summary>How long Dispose() waits for queued callbacks to drain.</summary>
+    private const int CallbackDrainTimeoutMs = 2000;
 
     private CheckSumOptions _checksumType = CheckSumOptions.Crc;
     private int _sleepDelay = 0;
@@ -96,6 +170,18 @@ public abstract class DF1BaseTransport : ITransport
     protected DF1BaseTransport(ISerialPort port)
     {
         _port = port ?? throw new ArgumentNullException(nameof(port));
+
+        // One executor for the lifetime of the transport, not per session, so
+        // callbacks from two sessions can never overlap and arrival order is
+        // preserved end to end.
+        //
+        // The pump invokes OnFrameReceived and friends, which are virtual — so in
+        // principle it could reach a derived override before that derived
+        // constructor has finished. It cannot in practice: nothing can post until
+        // the derived constructor subscribes to ISerialPort.BytesReceived, which
+        // is the last thing both do. A derived class that posts from its own
+        // constructor would break that, hence this note.
+        _callbackPump = Task.Run(PumpCallbacksAsync);
     }
 
     /// <summary>
@@ -107,10 +193,72 @@ public abstract class DF1BaseTransport : ITransport
     }
 
     /// <inheritdoc/>
-    public virtual void Open() => _port.Open();
+    public virtual void Open()
+    {
+        // Opened outside _wireLock, then the gate is lifted — mirroring Close().
+        // SerialPortWrapper.Open() does not wait for the callback lease today, so
+        // holding the lock across it would not deadlock; keeping the two
+        // symmetrical means it still will not if that ever changes.
+        _port.Open();
+
+        lock (_wireLock)
+            _wireClosed = false;
+    }
 
     /// <inheritdoc/>
-    public virtual void Close() => _port.Close();
+    public virtual void Close()
+    {
+        // The lock is taken to mark the port closed, then RELEASED before
+        // _port.Close(). Do not merge these back into one block.
+        //
+        // Holding _wireLock across _port.Close() deadlocks: SerialPortWrapper.Close()
+        // waits for its active callback to finish, and that callback is very likely
+        // inside SendControl() — every inbound data frame is ACKed — waiting for
+        // this very lock. Neither side yields, and the window is not narrow.
+        //
+        // Releasing first costs nothing. Taking the lock still lets a write already
+        // in progress finish, and once _wireClosed is set TryWritePort refuses, so
+        // no new write can begin while the port is closing.
+        lock (_wireLock)
+            _wireClosed = true;
+
+        _port.Close();
+    }
+
+    /// <summary>
+    /// Writes to the serial port under <c>_wireLock</c>. Every port write in
+    /// this class hierarchy must go through here: the receive thread writes
+    /// link-layer replies while a sender may be writing a data frame, and
+    /// <see cref="ISerialPort.Write"/> gives no thread-safety guarantee — two
+    /// concurrent writers would interleave DF1 bytes on the wire.
+    /// </summary>
+    /// <returns>False when the port is already closing; true once written.</returns>
+    /// <remarks>
+    /// Returning a flag rather than throwing matters: <see cref="ISerialPort.Write"/>
+    /// itself raises InvalidOperationException for a genuinely faulted port, and a
+    /// caller that swallowed the exception form would silence both.
+    /// </remarks>
+    protected bool TryWritePort(byte[] buffer, int offset, int count)
+    {
+        lock (_wireLock)
+        {
+            if (_wireClosed)
+                return false;
+            _port.Write(buffer, offset, count);
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// As <see cref="TryWritePort"/>, but throws when the port is closing. Used by
+    /// the send paths, where the caller must learn that the frame never went out.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">Thrown once the port is closing.</exception>
+    protected void WritePort(byte[] buffer, int offset, int count)
+    {
+        if (!TryWritePort(buffer, offset, count))
+            throw new InvalidOperationException("Serial port is closed.");
+    }
 
     /// <inheritdoc/>
     public abstract void SendFrame(byte[] innerFrame);
@@ -157,7 +305,11 @@ public abstract class DF1BaseTransport : ITransport
         if (controlByte != ACK && controlByte != NAK && controlByte != ENQ)
             throw new ArgumentException("Invalid control byte.", nameof(controlByte));
         var frame = new byte[] { DLE, controlByte };
-        _port.Write(frame, 0, frame.Length);
+
+        // Best-effort: a link-layer reply that loses the race with teardown is not
+        // worth propagating into the receive dispatcher. A real port fault still
+        // throws from Write() and is left to escape.
+        TryWritePort(frame, 0, frame.Length);
     }
 
     /// <summary>
@@ -187,6 +339,70 @@ public abstract class DF1BaseTransport : ITransport
             frame[idx++] = (byte)((checksum >> 8) & 0xFF);
         return frame;
     }
+
+    /// <summary>
+    /// Drains the callback queue, invoking one handler at a time in arrival
+    /// order. Runs for the lifetime of the transport.
+    /// </summary>
+    private async Task PumpCallbacksAsync()
+    {
+        try
+        {
+            await foreach (var item in _callbacks.Reader.ReadAllAsync().ConfigureAwait(false))
+            {
+                _onCallbackThread.Value = true;
+                try
+                {
+                    switch (item.kind)
+                    {
+                        case CallbackKind.Frame: OnFrameReceived(item.data); break;
+                        case CallbackKind.RawSent: OnRawFrameSent(item.data); break;
+                        case CallbackKind.RawReceived: OnRawFrameReceived(item.data); break;
+                    }
+                }
+                catch
+                {
+                    // A throwing subscriber must not take the executor down with
+                    // it; every later callback would be lost.
+                }
+                finally
+                {
+                    _onCallbackThread.Value = false;
+                }
+            }
+        }
+        catch (ChannelClosedException)
+        {
+            // Normal shutdown.
+        }
+    }
+
+    /// <summary>Queues <see cref="FrameReceived"/> for the callback executor.</summary>
+    protected void PostFrameReceived(byte[] innerFrame) =>
+        _callbacks.Writer.TryWrite((CallbackKind.Frame, innerFrame));
+
+    /// <summary>
+    /// Queues <see cref="RawFrameSent"/> for the callback executor.
+    /// </summary>
+    /// <remarks>
+    /// Unused today: both transports raise RawFrameSent on the caller's own
+    /// thread, where there is nothing to starve. Kept so all three events have a
+    /// posted form, and so a future send path on the receive thread has one.
+    /// </remarks>
+    protected void PostRawFrameSent(byte[] rawFrame) =>
+        _callbacks.Writer.TryWrite((CallbackKind.RawSent, rawFrame));
+
+    /// <summary>
+    /// Stops accepting new callbacks. Derived Dispose() implementations must call
+    /// this BEFORE taking their own locks: <see cref="Dispose"/> then waits for the
+    /// executor to drain, and a queued handler that wants _txLock could not finish
+    /// while teardown holds it — turning every disposal into a full drain timeout.
+    /// </summary>
+    protected void CompleteCallbacks() => _callbacks.Writer.TryComplete();
+
+    /// <summary>Queues <see cref="RawFrameReceived"/> for the callback executor.</summary>
+    protected void PostRawFrameReceived(byte[] rawFrame) =>
+        _callbacks.Writer.TryWrite((CallbackKind.RawReceived, rawFrame));
 
     /// <summary>Raises the <see cref="FrameReceived"/> event.</summary>
     protected virtual void OnFrameReceived(byte[] innerFrame)
@@ -277,6 +493,28 @@ public abstract class DF1BaseTransport : ITransport
     /// <inheritdoc/>
     public virtual void Dispose()
     {
+        lock (_wireLock)
+        {
+            _wireClosed = true;
+        }
         _port.Dispose();
+
+        // Let queued callbacks finish so a frame that reached the wire still
+        // raises its event. Skipped when Dispose() is itself called from a
+        // handler — the executor cannot wait for the thread it is standing on.
+        //
+        // CompleteCallbacks() is normally already done by the derived class before
+        // it took its locks; calling it again is harmless and covers a derived
+        // class that forgot.
+        CompleteCallbacks();
+        if (!_onCallbackThread.Value)
+        {
+            try
+            {
+                if (!_callbackPump.Wait(CallbackDrainTimeoutMs))
+                    Logger.Warn(this, $"{GetType().Name}: callback executor did not drain within {CallbackDrainTimeoutMs} ms");
+            }
+            catch (AggregateException) { /* pump faulted; nothing to do */ }
+        }
     }
 }

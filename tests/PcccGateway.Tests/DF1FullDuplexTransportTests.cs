@@ -366,4 +366,73 @@ public class DF1FullDuplexTransportTests
         await Task.Delay(50);
         Assert.Equal(inner, received);
     }
+
+    // ─── Link-control status vs. peer rejection ──────────────────────────────
+
+    /// <summary>
+    /// A NAK from the peer rejects a frame WE sent. It says nothing about whether
+    /// we accepted THEIR last data frame, which is what an ENQ asks us to repeat.
+    ///
+    /// The NAK branch of the receive state machine used to set the very flag the
+    /// ENQ reply reads, so after any rejected transmission an ENQ was answered NAK
+    /// for an unrelated reason — prompting the peer to retransmit a frame we had
+    /// already accepted and delivered.
+    /// </summary>
+    [Fact]
+    public async Task PeerNak_DoesNotChangeTheEnqReplyStatus()
+    {
+        var (port, transport) = Create();
+
+        // We accept the peer's data frame, so from here on an ENQ is owed an ACK.
+        port.SimulateReceive(BuildFrame(new byte[] { 0x01 }));
+        await Task.Delay(50);                          // write 1: our ACK
+
+        // The peer now NAKs a frame we send, then accepts the retry.
+        var sendTask = Task.Run(() => transport.SendFrame(new byte[] { 0x09 }));
+        await WaitForWriteCountAsync(port, 2, 1000);   // write 2: the frame
+        port.SimulateReceive(DLE, NAK);
+        await WaitForWriteCountAsync(port, 3, 1000);   // write 3: the retry
+        port.SimulateReceive(DLE, ACK);
+        await sendTask.WaitAsync(TimeSpan.FromMilliseconds(2000));
+
+        port.WrittenFrames.Clear();
+
+        port.SimulateReceive(DLE, ENQ);
+        await Task.Delay(50);
+
+        Assert.Contains(port.WrittenFrames, f => f.Length == 2 && f[0] == DLE && f[1] == ACK);
+        Assert.DoesNotContain(port.WrittenFrames, f => f.Length == 2 && f[0] == DLE && f[1] == NAK);
+    }
+
+    /// <summary>
+    /// Each SendFrame is completed by its own ACK, with no retry.
+    ///
+    /// This guards the per-attempt waiter's LIFECYCLE — that a completed
+    /// transaction leaves nothing behind able to satisfy or disturb the next one.
+    ///
+    /// It does NOT reproduce the stale-signal race that motivated per-attempt
+    /// waiters. That needs a Wait() to time out and read its flag while the
+    /// deferred Set() is still queued behind the control flush, and there is no
+    /// way to hold the flush at that instant through FakeSerialPort. Naming this
+    /// test after the race would claim coverage it does not have.
+    /// </summary>
+    [Fact]
+    public async Task BackToBackSends_AreEachCompletedByTheirOwnAck()
+    {
+        var (port, transport) = Create();
+
+        var first = Task.Run(() => transport.SendFrame(new byte[] { 0x01 }));
+        await WaitForWriteCountAsync(port, 1, 1000);
+        port.SimulateReceive(DLE, ACK);
+        await first.WaitAsync(TimeSpan.FromMilliseconds(2000));
+
+        var second = Task.Run(() => transport.SendFrame(new byte[] { 0x02 }));
+        await WaitForWriteCountAsync(port, 2, 1000);
+        port.SimulateReceive(DLE, ACK);
+        await second.WaitAsync(TimeSpan.FromMilliseconds(2000));
+
+        // Exactly two writes: a retry would mean one send was not satisfied by
+        // its own ACK.
+        Assert.Equal(2, port.WrittenFrames.Count);
+    }
 }
