@@ -46,8 +46,32 @@ using Gateway = PcccGateway.Gateway;
 /// </summary>
 class Program
 {
+    private const string BarePortToken = "[port]";
+
+    /// <summary>Options that apply whatever backend is selected.</summary>
+    private static readonly HashSet<string> UniversalOptions = new(StringComparer.Ordinal)
+    {
+        "--mode", "--listen-port", "--bind", "--quiet", "--help"
+    };
+
     /// <summary>
-    /// Raised when an option's value cannot be parsed or is out of range.
+    /// Options each backend actually reads. Anything else supplied alongside it
+    /// is rejected rather than accepted and dropped — see the check in Main.
+    /// </summary>
+    private static string[] OptionsFor(string mode) => mode switch
+    {
+        "df1"       => new[] { BarePortToken, "--baud", "--parity", "--checksum" },
+        "df1master" => new[] { BarePortToken, "--baud", "--parity", "--checksum",
+                               "--target", "--rs485-mode", "--rs485-assert-delay",
+                               "--rs485-deassert-delay", "--echo-suppression" },
+        "csp"       => new[] { "--host", "--csp-port", "--lsap-control" },
+        "eip"       => new[] { "--host", "--plc-eip-port" },
+        _           => Array.Empty<string>()
+    };
+
+    /// <summary>
+    /// Raised when an option's value cannot be parsed, is out of range, or does
+    /// not apply to the selected mode.
     /// </summary>
     private sealed class ArgumentParseException : Exception
     {
@@ -79,7 +103,7 @@ class Program
     static int Main(string[] args)
     {
         // ── Defaults ──────────────────────────────────────────────────────────
-        string portName   = "COM2";
+        string portName    = "COM2";
         string mode        = "df1";
         int    baud        = 19200;
         Parity parity      = Parity.None;
@@ -93,8 +117,13 @@ class Program
         int    cspPort     = 2222;
         int    plcEipPort  = 44818;
         int    listenPort  = EIPServerTransport.EIP_DEFAULT_PORT; // frontend
+        byte   lsapControl = 0x00;       // CSP LSAP control byte (see CSPTransport)
         System.Net.IPAddress? bindAddr = null; // EIP server bind interface (default all)
         bool   quiet       = false;
+
+        // Which options the operator actually typed, so the mode check below can
+        // tell "left at its default" from "asked for and then ignored".
+        var supplied = new HashSet<string>(StringComparer.Ordinal);
 
         // ── Parse arguments ──────────────────────────────────────────────────
         try
@@ -104,18 +133,43 @@ class Program
                 string a = args[i].ToLowerInvariant();
 
                 // First bare token (not a flag) is the serial port.
-                if (i == 0 && !a.StartsWith("--")) { portName = args[i]; continue; }
+                //
+                // Tested against "-", not "--": the short forms -q and -h are
+                // flags too, and treating them as a port name meant
+                // `dotnet run -- -h` opened a serial port called "-h" instead of
+                // printing the help. No serial port is named with a leading dash
+                // on any platform this runs on — COMn, /dev/ttyS*, /dev/tty.* —
+                // so nothing legitimate is excluded, and an unrecognised short
+                // option now reaches the default case and is reported.
+                if (i == 0 && !a.StartsWith("-", StringComparison.Ordinal))
+                {
+                    portName = args[i];
+                    supplied.Add(BarePortToken);
+                    continue;
+                }
 
                 switch (a)
                 {
-                    case "--mode"     when i + 1 < args.Length: mode = args[++i].ToLowerInvariant(); break;
-                    case "--baud"     when i + 1 < args.Length: baud       = ParseInt("--baud", args[++i], 1, 4_000_000); break;
-                    case "--target"   when i + 1 < args.Length: target     = ParseInt("--target", args[++i], 1, 254); break;
-                    case "--host"     when i + 1 < args.Length: host = args[++i]; break;
-                    case "--csp-port" when i + 1 < args.Length: cspPort    = ParseInt("--csp-port", args[++i], 1, 65535); break;
-                    case "--plc-eip-port" when i + 1 < args.Length: plcEipPort = ParseInt("--plc-eip-port", args[++i], 1, 65535); break;
-                    case "--listen-port"  when i + 1 < args.Length: listenPort = ParseInt("--listen-port", args[++i], 1, 65535); break;
-                    case "--bind"         when i + 1 < args.Length:
+                    case "--mode" when i + 1 < args.Length:
+                        mode = args[++i].ToLowerInvariant();
+                        if (mode is not ("df1" or "df1master" or "csp" or "eip"))
+                            throw new ArgumentParseException(
+                                $"--mode expects df1, df1master, csp or eip, got '{mode}'.");
+                        supplied.Add("--mode");
+                        break;
+                    case "--baud" when i + 1 < args.Length:
+                        baud = ParseInt("--baud", args[++i], 1, 4_000_000); supplied.Add("--baud"); break;
+                    case "--target" when i + 1 < args.Length:
+                        target = ParseInt("--target", args[++i], 1, 254); supplied.Add("--target"); break;
+                    case "--host" when i + 1 < args.Length:
+                        host = args[++i]; supplied.Add("--host"); break;
+                    case "--csp-port" when i + 1 < args.Length:
+                        cspPort = ParseInt("--csp-port", args[++i], 1, 65535); supplied.Add("--csp-port"); break;
+                    case "--plc-eip-port" when i + 1 < args.Length:
+                        plcEipPort = ParseInt("--plc-eip-port", args[++i], 1, 65535); supplied.Add("--plc-eip-port"); break;
+                    case "--listen-port" when i + 1 < args.Length:
+                        listenPort = ParseInt("--listen-port", args[++i], 1, 65535); supplied.Add("--listen-port"); break;
+                    case "--bind" when i + 1 < args.Length:
                         if (!System.Net.IPAddress.TryParse(args[++i], out bindAddr))
                             throw new ArgumentParseException($"--bind expects an IP address, got '{args[i]}'.");
                         if (bindAddr.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork)
@@ -124,23 +178,30 @@ class Program
                             // (sin_family = AF_INET); an IPv6 bind would corrupt that payload.
                             throw new ArgumentParseException("--bind requires an IPv4 address.");
                         }
+                        supplied.Add("--bind");
                         break;
-                    case "--checksum"   when i + 1 < args.Length:
+                    case "--checksum" when i + 1 < args.Length:
                         checksum = args[++i].ToLowerInvariant();
                         if (checksum is not ("crc" or "bcc"))
                             throw new ArgumentParseException($"--checksum expects crc or bcc, got '{checksum}'.");
+                        supplied.Add("--checksum");
                         break;
                     case "--rs485-mode" when i + 1 < args.Length:
                         rs485Mode = args[++i].ToLowerInvariant();
                         if (rs485Mode is not ("auto" or "rts" or "dtr"))
                             throw new ArgumentParseException($"--rs485-mode expects auto, rts or dtr, got '{rs485Mode}'.");
+                        supplied.Add("--rs485-mode");
                         break;
-                    case "--rs485-assert-delay"   when i + 1 < args.Length: rs485Assert  = ParseInt("--rs485-assert-delay", args[++i], 0, 1000); break;
-                    case "--rs485-deassert-delay" when i + 1 < args.Length: rs485Deassrt = ParseInt("--rs485-deassert-delay", args[++i], 0, 1000); break;
-                    case "--echo-suppression": echoSuppr = true; break;
+                    case "--rs485-assert-delay" when i + 1 < args.Length:
+                        rs485Assert = ParseInt("--rs485-assert-delay", args[++i], 0, 1000); supplied.Add("--rs485-assert-delay"); break;
+                    case "--rs485-deassert-delay" when i + 1 < args.Length:
+                        rs485Deassrt = ParseInt("--rs485-deassert-delay", args[++i], 0, 1000); supplied.Add("--rs485-deassert-delay"); break;
+                    case "--echo-suppression":
+                        echoSuppr = true; supplied.Add("--echo-suppression"); break;
                     case "--lsap-control" when i + 1 < args.Length:
-                        if (!byte.TryParse(args[++i], NumberStyles.HexNumber, null, out lsapControl))
+                        if (!byte.TryParse(args[++i], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out lsapControl))
                             throw new ArgumentParseException($"--lsap-control expects a hex byte, got '{args[i]}'.");
+                        supplied.Add("--lsap-control");
                         break;
                     case "--parity" when i + 1 < args.Length:
                         parity = args[++i].ToLowerInvariant() switch
@@ -150,13 +211,32 @@ class Program
                             "even" => Parity.Even,
                             _      => throw new ArgumentParseException($"--parity expects none, odd or even, got '{args[i]}'.")
                         };
+                        supplied.Add("--parity");
                         break;
-                    case "--quiet": case "-q": quiet = true; break;
+                    case "--quiet": case "-q": quiet = true; supplied.Add("--quiet"); break;
                     case "--help":  case "-h": PrintUsage(); return 0;
                     default:
                         Console.Error.WriteLine($"Unknown or incomplete argument: '{args[i]}'. Use --help.");
                         return 2;
                 }
+            }
+
+            // Reject options the selected backend does not read. They parse fine
+            // and are then dropped, so without this the operator is told nothing:
+            // --mode csp --baud 9600 starts happily and the baud rate that was
+            // asked for never applies to anything. Same silence as a bad value
+            // being ignored, one level up — the value is valid, the context is not.
+            var applicable = new HashSet<string>(OptionsFor(mode), StringComparer.Ordinal);
+            var stray = supplied
+                .Where(o => !UniversalOptions.Contains(o) && !applicable.Contains(o))
+                .OrderBy(o => o, StringComparer.Ordinal)
+                .ToList();
+
+            if (stray.Count > 0)
+            {
+                throw new ArgumentParseException(
+                    $"--mode {mode} does not use: {string.Join(", ", stray)}. " +
+                    $"It reads: {string.Join(", ", OptionsFor(mode))}.");
             }
         }
         catch (ArgumentParseException ex)
@@ -187,7 +267,6 @@ class Program
                     break;
 
                 case "df1master":
-                case "df1slave":   // alias
                     plcTransport = new DF1HalfDuplexTransport(portName, baud, parity)
                     {
                         SlaveAddress       = target,
@@ -227,8 +306,8 @@ class Program
                     break;
 
                 default:
-                    Console.Error.WriteLine($"Unknown --mode '{mode}'. Valid: df1, df1master, csp, eip.");
-                    return 2;
+                    // Unreachable: --mode is validated while parsing.
+                    throw new ArgumentException($"Unhandled --mode '{mode}'.");
             }
         }
         catch (Exception ex)
@@ -262,7 +341,7 @@ class Program
 
             // Configuration summary.
             Console.WriteLine($"      Mode        : {mode}");
-            if (mode is "df1" or "df1master" or "df1slave")
+            if (mode is "df1" or "df1master")
             {
                 Console.WriteLine($"      Port        : {portName}");
                 Console.WriteLine($"      Baud rate   : {baud}");
@@ -291,6 +370,16 @@ class Program
 
             // Block until Ctrl+C (SIGINT/SIGTERM). Works whether stdin is a console
             // or redirected, so the process runs cleanly as a service/container.
+            //
+            // The two paths are NOT equivalent for shutdown. Ctrl+C sets Cancel, so
+            // the process keeps running normally and the finally block below gets as
+            // long as it needs. ProcessExit — SIGTERM, `docker stop`, a service
+            // manager — runs during runtime shutdown under a budget of roughly two
+            // seconds, and the disposal below can want more than that while the DF1
+            // callback executor and the serial consumer drain. On that path teardown
+            // may be cut short. The drains are best-effort by design so nothing is
+            // corrupted; it simply is not the guarantee the Ctrl+C path gives, and
+            // the limit belongs to the runtime rather than to this code.
             using var stop = new ManualResetEventSlim(false);
             Console.CancelKeyPress += (s, e) => { e.Cancel = true; stop.Set(); };
             AppDomain.CurrentDomain.ProcessExit += (s, e) => stop.Set();
@@ -325,9 +414,6 @@ class Program
         }
     }
 
-    // LSAP control byte for csp mode; hex, default 0x00 (see CSPTransport remarks).
-    static byte lsapControl = 0x00;
-
     /// <summary>
     /// True when the host string names this machine — loopback, or any address
     /// bound to one of its interfaces.
@@ -360,23 +446,25 @@ class Program
         Console.WriteLine("Usage:");
         Console.WriteLine("  dotnet run -- [port] [options]");
         Console.WriteLine();
+        Console.WriteLine("Options that do not apply to the selected --mode are rejected, not ignored.");
+        Console.WriteLine();
         Console.WriteLine("PLC-side transport (backend):");
         Console.WriteLine("  --mode <df1|df1master|csp|eip>  Transport mode (default df1)");
-        Console.WriteLine("  [port]                          Serial port for df1/df1master (default COM2)");
-        Console.WriteLine("  --baud <n>                      Baud rate (default 19200)");
-        Console.WriteLine("  --parity <none|odd|even>        Parity (default none)");
-        Console.WriteLine("  --checksum <crc|bcc>            DF1 checksum (default crc)");
-        Console.WriteLine("  --target <1-254>                df1master slave node address (default 1)");
-        Console.WriteLine("  --rs485-mode <auto|rts|dtr>     RS-485 direction control (default auto)");
-        Console.WriteLine("  --rs485-assert-delay <ms>       Delay after enabling driver (default 1)");
-        Console.WriteLine("  --rs485-deassert-delay <ms>     Delay before disabling driver (default 5)");
-        Console.WriteLine("  --echo-suppression              Discard echoed bytes on RS-485");
-        Console.WriteLine("  --host <ip>                     PLC IP address (required for csp/eip)");
-        Console.WriteLine("  --csp-port <n>                  PLC CSP port (default 2222)");
-        Console.WriteLine("  --plc-eip-port <n>              PLC EtherNet/IP port (default 44818)");
-        Console.WriteLine("  --lsap-control <hex>            CSP LSAP control byte (default 00)");
+        Console.WriteLine("  [port]                          Serial port (default COM2)         [df1, df1master]");
+        Console.WriteLine("  --baud <n>                      Baud rate (default 19200)          [df1, df1master]");
+        Console.WriteLine("  --parity <none|odd|even>        Parity (default none)              [df1, df1master]");
+        Console.WriteLine("  --checksum <crc|bcc>            DF1 checksum (default crc)         [df1, df1master]");
+        Console.WriteLine("  --target <1-254>                Slave node address (default 1)     [df1master]");
+        Console.WriteLine("  --rs485-mode <auto|rts|dtr>     RS-485 direction control (auto)    [df1master]");
+        Console.WriteLine("  --rs485-assert-delay <ms>       Delay after enabling driver (1)    [df1master]");
+        Console.WriteLine("  --rs485-deassert-delay <ms>     Delay before disabling driver (5)  [df1master]");
+        Console.WriteLine("  --echo-suppression              Discard echoed bytes on RS-485     [df1master]");
+        Console.WriteLine("  --host <ip>                     PLC IP address (required)          [csp, eip]");
+        Console.WriteLine("  --csp-port <n>                  PLC CSP port (default 2222)        [csp]");
+        Console.WriteLine("  --lsap-control <hex>            CSP LSAP control byte (default 00) [csp]");
+        Console.WriteLine("  --plc-eip-port <n>              PLC EtherNet/IP port (44818)       [eip]");
         Console.WriteLine();
-        Console.WriteLine("Frontend (EIP server) and misc:");
+        Console.WriteLine("Frontend (EIP server) and misc — apply to every mode:");
         Console.WriteLine("  --listen-port <n>               EIP server listen port (default 44818)");
         Console.WriteLine("  --bind <ip>                     Bind EIP server to one interface (default all;");
         Console.WriteLine("                                  note: binding may disable RSLinx broadcast browse)");
