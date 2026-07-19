@@ -46,6 +46,36 @@ using Gateway = PcccGateway.Gateway;
 /// </summary>
 class Program
 {
+    /// <summary>
+    /// Raised when an option's value cannot be parsed or is out of range.
+    /// </summary>
+    private sealed class ArgumentParseException : Exception
+    {
+        public ArgumentParseException(string message) : base(message) { }
+    }
+
+    /// <summary>
+    /// Parses an integer option, refusing anything that is not one.
+    /// </summary>
+    /// <remarks>
+    /// Every numeric option used to be parsed with a bare
+    /// <c>if (int.TryParse(...)) x = v;</c> and no else branch, so a typo left
+    /// the default silently in place and the gateway ran with a configuration
+    /// nobody had asked for. Worse for values that parse but cannot work:
+    /// --baud 0 reached SerialPort.Open(), which throws inside the link
+    /// supervisor, which catches it, logs "PLC connect failed - retrying", and
+    /// loops forever. An operator watching that sees a link problem, not the
+    /// configuration error it actually is.
+    /// </remarks>
+    private static int ParseInt(string option, string value, int min, int max)
+    {
+        if (!int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out int parsed))
+            throw new ArgumentParseException($"{option} expects an integer, got '{value}'.");
+        if (parsed < min || parsed > max)
+            throw new ArgumentParseException($"{option} must be between {min} and {max}, got {parsed}.");
+        return parsed;
+    }
+
     static int Main(string[] args)
     {
         // ── Defaults ──────────────────────────────────────────────────────────
@@ -66,59 +96,73 @@ class Program
         System.Net.IPAddress? bindAddr = null; // EIP server bind interface (default all)
         bool   quiet       = false;
 
-        // ── Parse arguments (pattern mirrors the PCCCComm example client) ────
-        for (int i = 0; i < args.Length; i++)
+        // ── Parse arguments ──────────────────────────────────────────────────
+        try
         {
-            string a = args[i].ToLowerInvariant();
-
-            // First bare token (not a flag) is the serial port.
-            if (i == 0 && !a.StartsWith("--")) { portName = args[i]; continue; }
-
-            switch (a)
+            for (int i = 0; i < args.Length; i++)
             {
-                case "--mode"     when i + 1 < args.Length: mode     = args[++i].ToLowerInvariant(); break;
-                case "--baud"     when i + 1 < args.Length: if (int.TryParse(args[++i], out var b))  baud   = b;      break;
-                case "--target"   when i + 1 < args.Length: if (int.TryParse(args[++i], out var t))  target = t;      break;
-                case "--host"     when i + 1 < args.Length: host = args[++i]; break;
-                case "--csp-port" when i + 1 < args.Length: if (int.TryParse(args[++i], out var c))  cspPort    = c;  break;
-                case "--plc-eip-port" when i + 1 < args.Length: if (int.TryParse(args[++i], out var pe)) plcEipPort = pe; break;
-                case "--listen-port"  when i + 1 < args.Length: if (int.TryParse(args[++i], out var lp)) listenPort = lp; break;
-                case "--bind"         when i + 1 < args.Length:
-                    if (!System.Net.IPAddress.TryParse(args[++i], out bindAddr))
-                    {
-                        Console.Error.WriteLine("Warning: invalid --bind address, binding to all interfaces.");
-                    }
-                    else if (bindAddr.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork)
-                    {
-                        // EtherNet/IP's List Identity socket-address field is IPv4-only
-                        // (sin_family = AF_INET); an IPv6 bind would corrupt that payload.
-                        Console.Error.WriteLine("Warning: --bind requires an IPv4 address; binding to all interfaces.");
-                        bindAddr = null;
-                    }
-                    break;
-                case "--checksum"           when i + 1 < args.Length: checksum   = args[++i].ToLowerInvariant(); break;
-                case "--rs485-mode"         when i + 1 < args.Length: rs485Mode  = args[++i].ToLowerInvariant(); break;
-                case "--rs485-assert-delay"   when i + 1 < args.Length: if (int.TryParse(args[++i], out var ad)) rs485Assert  = ad; break;
-                case "--rs485-deassert-delay" when i + 1 < args.Length: if (int.TryParse(args[++i], out var dd)) rs485Deassrt = dd; break;
-                case "--echo-suppression": echoSuppr = true; break;
-                case "--lsap-control" when i + 1 < args.Length:
-                    if (!byte.TryParse(args[++i], NumberStyles.HexNumber, null, out lsapControl))
-                        Console.Error.WriteLine("Warning: invalid --lsap-control (expected hex), using 0x00.");
-                    break;
-                case "--parity" when i + 1 < args.Length:
-                    parity = args[++i].ToLowerInvariant() switch
-                    {
-                        "odd"  => Parity.Odd,
-                        "even" => Parity.Even,
-                        _      => Parity.None
-                    };
-                    break;
-                case "--quiet": case "-q": quiet = true; break;
-                case "--help":  case "-h": PrintUsage(); return 0;
-                default:
-                    Console.Error.WriteLine($"Unknown or incomplete argument: '{args[i]}'. Use --help.");
-                    return 2;
+                string a = args[i].ToLowerInvariant();
+
+                // First bare token (not a flag) is the serial port.
+                if (i == 0 && !a.StartsWith("--")) { portName = args[i]; continue; }
+
+                switch (a)
+                {
+                    case "--mode"     when i + 1 < args.Length: mode = args[++i].ToLowerInvariant(); break;
+                    case "--baud"     when i + 1 < args.Length: baud       = ParseInt("--baud", args[++i], 1, 4_000_000); break;
+                    case "--target"   when i + 1 < args.Length: target     = ParseInt("--target", args[++i], 1, 254); break;
+                    case "--host"     when i + 1 < args.Length: host = args[++i]; break;
+                    case "--csp-port" when i + 1 < args.Length: cspPort    = ParseInt("--csp-port", args[++i], 1, 65535); break;
+                    case "--plc-eip-port" when i + 1 < args.Length: plcEipPort = ParseInt("--plc-eip-port", args[++i], 1, 65535); break;
+                    case "--listen-port"  when i + 1 < args.Length: listenPort = ParseInt("--listen-port", args[++i], 1, 65535); break;
+                    case "--bind"         when i + 1 < args.Length:
+                        if (!System.Net.IPAddress.TryParse(args[++i], out bindAddr))
+                            throw new ArgumentParseException($"--bind expects an IP address, got '{args[i]}'.");
+                        if (bindAddr.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork)
+                        {
+                            // EtherNet/IP's List Identity socket-address field is IPv4-only
+                            // (sin_family = AF_INET); an IPv6 bind would corrupt that payload.
+                            throw new ArgumentParseException("--bind requires an IPv4 address.");
+                        }
+                        break;
+                    case "--checksum"   when i + 1 < args.Length:
+                        checksum = args[++i].ToLowerInvariant();
+                        if (checksum is not ("crc" or "bcc"))
+                            throw new ArgumentParseException($"--checksum expects crc or bcc, got '{checksum}'.");
+                        break;
+                    case "--rs485-mode" when i + 1 < args.Length:
+                        rs485Mode = args[++i].ToLowerInvariant();
+                        if (rs485Mode is not ("auto" or "rts" or "dtr"))
+                            throw new ArgumentParseException($"--rs485-mode expects auto, rts or dtr, got '{rs485Mode}'.");
+                        break;
+                    case "--rs485-assert-delay"   when i + 1 < args.Length: rs485Assert  = ParseInt("--rs485-assert-delay", args[++i], 0, 1000); break;
+                    case "--rs485-deassert-delay" when i + 1 < args.Length: rs485Deassrt = ParseInt("--rs485-deassert-delay", args[++i], 0, 1000); break;
+                    case "--echo-suppression": echoSuppr = true; break;
+                    case "--lsap-control" when i + 1 < args.Length:
+                        if (!byte.TryParse(args[++i], NumberStyles.HexNumber, null, out lsapControl))
+                            throw new ArgumentParseException($"--lsap-control expects a hex byte, got '{args[i]}'.");
+                        break;
+                    case "--parity" when i + 1 < args.Length:
+                        parity = args[++i].ToLowerInvariant() switch
+                        {
+                            "none" => Parity.None,
+                            "odd"  => Parity.Odd,
+                            "even" => Parity.Even,
+                            _      => throw new ArgumentParseException($"--parity expects none, odd or even, got '{args[i]}'.")
+                        };
+                        break;
+                    case "--quiet": case "-q": quiet = true; break;
+                    case "--help":  case "-h": PrintUsage(); return 0;
+                    default:
+                        Console.Error.WriteLine($"Unknown or incomplete argument: '{args[i]}'. Use --help.");
+                        return 2;
+                }
             }
+        }
+        catch (ArgumentParseException ex)
+        {
+            Console.Error.WriteLine($"Configuration error: {ex.Message}");
+            return 2;
         }
 
         Console.WriteLine("PcccGateway - PCCC Protocol Gateway");
@@ -144,8 +188,6 @@ class Program
 
                 case "df1master":
                 case "df1slave":   // alias
-                    if (target < 1 || target > 254)
-                        throw new ArgumentException("--target (slave node) must be 1-254 for df1master.");
                     plcTransport = new DF1HalfDuplexTransport(portName, baud, parity)
                     {
                         SlaveAddress       = target,
@@ -171,13 +213,16 @@ class Program
                 case "eip":
                     if (string.IsNullOrEmpty(host))
                         throw new ArgumentException("eip mode requires --host <PLC IP>.");
-                    // Guard against pointing the EIP backend at our own frontend:
-                    // a loopback host on the same port loops the gateway into itself.
-                    if (IsLoopback(host) && plcEipPort == listenPort)
+                    // Guard against pointing the EIP backend at our own frontend.
+                    // Loopback is not the only way to reach ourselves: a host that
+                    // names one of this machine's own interface addresses loops
+                    // just as surely, and that is the easier mistake to make when
+                    // copying the gateway's own IP out of a config file.
+                    if (IsThisMachine(host) && plcEipPort == listenPort)
                         throw new ArgumentException(
-                            $"eip backend targets loopback:{plcEipPort}, the same as --listen-port " +
-                            $"({listenPort}) — this would loop the gateway into its own server. " +
-                            "Use a different --plc-eip-port or --listen-port.");
+                            $"eip backend targets {host}:{plcEipPort}, which is this machine on the " +
+                            $"same port as --listen-port ({listenPort}) — this would loop the gateway " +
+                            "into its own server. Use a different --plc-eip-port or --listen-port.");
                     plcTransport = new EIPTransport(host, plcEipPort, 5000);
                     break;
 
@@ -251,13 +296,31 @@ class Program
             AppDomain.CurrentDomain.ProcessExit += (s, e) => stop.Set();
             stop.Wait();
 
-            gateway.Stop();
             Console.WriteLine("Gateway stopped.");
             return 0;
         }
         finally
         {
-            gateway?.Stop(); // Ensure cleanup even if Start() threw or was interrupted.
+            // Dispose, not just Stop. Stop() only closes the link; the transports
+            // do their real teardown in Dispose() — completing callback channels
+            // and draining the executor threads DF1 starts for the lifetime of the
+            // transport. Nothing used to call it: Gateway disposes the EIP server
+            // it creates but not the PLC transport it is handed, and this method
+            // stopped at Stop(). The process exiting hid it, which also meant the
+            // drain path only ever ran under test.
+            //
+            // Each step is guarded on its own. Teardown here is exactly where a
+            // throw is least acceptable: SerialPortWrapper.Dispose deliberately
+            // rethrows a failed port close rather than swallowing it, so an
+            // unguarded chain would let that skip the drain and the log flush that
+            // follow it. Console.Error rather than Logger, because --quiet has
+            // disabled Logger and this is the last chance to say anything.
+            try { gateway?.Dispose(); }
+            catch (Exception ex) { Console.Error.WriteLine($"Gateway dispose failed: {ex.Message}"); }
+
+            try { plcTransport.Dispose(); }
+            catch (Exception ex) { Console.Error.WriteLine($"PLC transport dispose failed: {ex.Message}"); }
+
             Logger.Shutdown(1000);
         }
     }
@@ -265,12 +328,29 @@ class Program
     // LSAP control byte for csp mode; hex, default 0x00 (see CSPTransport remarks).
     static byte lsapControl = 0x00;
 
-    /// <summary>True if the host string refers to the local loopback interface.</summary>
-    static bool IsLoopback(string host)
+    /// <summary>
+    /// True when the host string names this machine — loopback, or any address
+    /// bound to one of its interfaces.
+    /// </summary>
+    private static bool IsThisMachine(string host)
     {
         if (string.Equals(host, "localhost", StringComparison.OrdinalIgnoreCase)) return true;
-        return System.Net.IPAddress.TryParse(host, out var ip) &&
-               System.Net.IPAddress.IsLoopback(ip);
+        if (!System.Net.IPAddress.TryParse(host, out var ip)) return false;
+        if (System.Net.IPAddress.IsLoopback(ip)) return true;
+
+        try
+        {
+            foreach (var ni in System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces())
+                foreach (var ua in ni.GetIPProperties().UnicastAddresses)
+                    if (ua.Address.Equals(ip))
+                        return true;
+        }
+        catch
+        {
+            // Interface enumeration can fail in restricted environments. Fall back
+            // to the loopback check rather than refusing to start over a guard.
+        }
+        return false;
     }
 
     static void PrintUsage()
