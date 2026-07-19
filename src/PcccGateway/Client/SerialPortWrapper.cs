@@ -30,22 +30,21 @@ namespace PcccGateway.Client;
 /// Threading model:
 /// <list type="bullet">
 ///   <item>
-///     A single pair of lifetime tasks (<see cref="DispatchLoopAsync"/> and
-///     <see cref="CallbackLoopAsync"/>) is started once in the constructor and
-///     runs until <see cref="Dispose"/>. They are NEVER restarted on
-///     Open()/Close(), so callbacks from two sessions can never overlap and
-///     ordered serial processing is preserved.
+///     One consumer task, started in the constructor and running until
+///     <see cref="Dispose"/>. It is NEVER restarted on Open()/Close(), so
+///     callbacks from two sessions can never overlap and arrival order is
+///     preserved end to end.
 ///   </item>
 ///   <item>
-///     Each received chunk is tagged with the session <c>generation</c> that
-///     was active when it arrived. Close()/Open()/Dispose() bump the
-///     generation, so any chunk still queued from a previous session is
-///     dropped by the callback loop instead of being delivered late.
+///     Each received chunk is tagged with the session <c>generation</c> that was
+///     active when it arrived. Open()/Close()/Dispose() bump the generation, so a
+///     chunk still queued from a previous session is dropped by the consumer
+///     rather than delivered late.
 ///   </item>
 ///   <item>
-///     All lifecycle and I/O state (<c>_open</c>, <c>_closing</c>,
-///     <c>_disposed</c>, <c>_generation</c>) is guarded by <c>_sync</c>.
-///     Operations are rejected once disposal begins.
+///     All lifecycle state (<c>_open</c>, <c>_closing</c>, <c>_disposed</c>,
+///     <c>_generation</c>) is guarded by <c>_sync</c>. Operations are rejected
+///     once disposal begins.
 ///   </item>
 /// </list>
 /// </summary>
@@ -54,7 +53,7 @@ public class SerialPortWrapper : ISerialPort
     private readonly ISerialPort _port;
     private readonly object _sync = new object();
 
-    // Received chunks are handed off through these channels instead of being dispatched
+    // Received chunks are handed off through this channel instead of being dispatched
     // straight from the SerialPort driver's own callback thread. Reading synchronously
     // there risks a deadlock if a handler calls back into the port (e.g. Close()) from
     // the same thread the driver uses to raise DataReceived. A single dedicated consumer
@@ -63,43 +62,22 @@ public class SerialPortWrapper : ISerialPort
     // scheduling gave no guarantee that two work items would run in the order they were
     // queued, letting a later chunk of the same DF1/CSP stream reach the consumer before
     // an earlier one and corrupt frame reassembly.
-    private readonly Channel<(int gen, byte[] data)> _rxChannel = Channel.CreateBounded<(int, byte[])>(
-        new BoundedChannelOptions(100)  // max 100 pending chunks
+    //
+    // Unbounded, and one channel rather than two. An earlier revision bounded this at
+    // 100 and closed the port on overflow, and fed a second channel so a slow
+    // subscriber could not stall the reader. Both existed for a subscriber that ran
+    // user code on this consumer. DF1BaseTransport now owns a callback executor and
+    // raises its public events there, so the handler here only parses into a ring
+    // buffer and returns — bounded work, no user code. What the bound bought is gone;
+    // what it cost was a failure mode of its own, dropping the link because a handler
+    // was briefly slow.
+    private readonly Channel<(int gen, byte[] data)> _rxChannel =
+        Channel.CreateUnbounded<(int, byte[])>(new UnboundedChannelOptions
         {
-            // false: DrainQueues() may TryRead concurrently with the consumer
-            // loop, so we cannot promise a single reader.
-            SingleReader = false,
-            SingleWriter = false,
-            // FullMode only matters for the blocking WriteAsync path; OnBytesReceived
-            // uses TryWrite, which returns false immediately when the channel is full.
-            FullMode = BoundedChannelFullMode.Wait
+            SingleReader = true,   // only CallbackLoopAsync reads
+            SingleWriter = false   // the driver may raise DataReceived on any pool thread
         });
 
-    // Secondary channel that moves callback invocation off the channel-draining
-    // loop, so a slow subscriber cannot stall the reader.
-    //
-    // NOTE: this does NOT by itself break the SendFrame-from-BytesReceived
-    // deadlock, and an earlier revision of this comment wrongly claimed that it
-    // did. The DF1 transports parse inbound bytes inside their BytesReceived
-    // handler, which runs ON this consumer — parsing and callback are the same
-    // thread here.
-    //
-    // What breaks the cycle lives one layer up: DF1BaseTransport owns a callback
-    // executor and posts its public receive-path events to it, so a subscriber
-    // that calls SendFrame() runs on that executor while this consumer stays free
-    // to parse the ACK it waits for. This consumer is responsible for parsing
-    // alone.
-    private readonly Channel<(int gen, byte[] data)> _callbackChannel = Channel.CreateBounded<(int, byte[])>(
-        new BoundedChannelOptions(100)
-        {
-            // false: DrainQueues() may TryRead concurrently with the consumer
-            // loop, so we cannot promise a single reader.
-            SingleReader = false,
-            SingleWriter = true,
-            FullMode = BoundedChannelFullMode.Wait
-        });
-
-    private readonly Task _rxDispatchTask;
     private readonly Task _callbackTask;
 
     // Guarded by _sync.
@@ -112,15 +90,13 @@ public class SerialPortWrapper : ISerialPort
     // repeat the whole teardown, and Open()/Read()/Write() could still start
     // work after disposal had begun.
     private bool _disposing;
-    private int _recoveryGeneration = -1; // generation for which overflow recovery is already scheduled
 
-    // True while a CloseInternal has claimed the teardown but has not finished it.
-    // WaitForCallbackLease() parks in Monitor.Wait, which releases _sync, and the
-    // teardown is only half done at that point: _open is already false but the
-    // generation has not been bumped yet. Without this marker Open() would see
-    // _open == false, publish a whole new session, and the parked close would then
-    // wake up and bump the generation and shut the port belonging to that NEW
-    // session. Guarded by _sync (+ Monitor pulse on release).
+    // True while a Close() has claimed the teardown but has not finished it.
+    // WaitForCallbackLease() releases _sync, and the teardown is only half done at
+    // that point: _open is already false but the generation has not been bumped.
+    // Without this marker Open() would see _open == false, publish a whole new
+    // session, and the parked close would then wake up, bump the generation and
+    // shut the port belonging to that NEW session.
     private bool _closing;
 
     // Managed thread id currently executing a BytesReceived handler, or -1.
@@ -129,24 +105,28 @@ public class SerialPortWrapper : ISerialPort
     // would wait on their own thread). Written with Volatile so callers see it.
     private int _callbackThreadId = -1;
 
-    // Callback lease: true between the moment the callback loop passes the
-    // generation check (admitting a chunk for delivery) and the moment its
-    // handler returns. Close()/Dispose() wait for the lease to clear before
-    // bumping the generation, so a chunk admitted for the current session can
-    // never be delivered into a session that Close()+Open() opened in between.
+    // Callback lease: true between the moment the consumer passes the generation
+    // check (admitting a chunk for delivery) and the moment its handler returns.
+    // Close()/Dispose() wait for the lease to clear before bumping the generation.
+    //
+    // The generation tag alone is not enough. It stops a chunk being admitted into
+    // the wrong session, but says nothing about one already being delivered: without
+    // the lease, Close() would return while a handler was still running, Open()
+    // would clear the transport's receive buffer, and that handler would then finish
+    // writing the previous session's bytes into the fresh one.
     // Guarded by _sync (+ Monitor pulse on release).
     private bool _callbackActive;
 
     /// <summary>
     /// Raised, in strict arrival order, for each received chunk on the single
-    /// lifetime callback executor.
+    /// lifetime callback consumer.
     /// </summary>
     /// <remarks>
-    /// KNOWN LIMITATION — re-entrancy: handlers run on the one callback consumer
-    /// thread, which is also the only thread that parses inbound bytes. A handler
-    /// that BLOCKS waiting for more of those bytes deadlocks, because what it
-    /// waits for can only be parsed once it returns. Handlers must be
-    /// non-blocking; offload anything that waits on further I/O to another thread.
+    /// KNOWN LIMITATION — re-entrancy: handlers run on the one consumer thread,
+    /// which is also the only thread that parses inbound bytes. A handler that
+    /// BLOCKS waiting for more of those bytes deadlocks, because what it waits for
+    /// can only be parsed once it returns. Handlers must be non-blocking; offload
+    /// anything that waits on further I/O to another thread.
     ///
     /// The DF1 transports can no longer hit this. Their handler here only parses
     /// and queues, and their own public events are raised on DF1BaseTransport's
@@ -178,10 +158,9 @@ public class SerialPortWrapper : ISerialPort
         _port = port ?? throw new ArgumentNullException(nameof(port));
         _port.BytesReceived += OnBytesReceived;
 
-        // Start the single lifetime executor pair. They run until Dispose()
-        // completes the channels.
-        _rxDispatchTask = Task.Run(DispatchLoopAsync);
-        _callbackTask   = Task.Run(CallbackLoopAsync);
+        // One consumer for the lifetime of the wrapper. It runs until Dispose()
+        // completes the channel.
+        _callbackTask = Task.Run(CallbackLoopAsync);
     }
 
     private void OnBytesReceived(object? sender, byte[] chunk)
@@ -202,87 +181,9 @@ public class SerialPortWrapper : ISerialPort
         // guarantees the deferred consumer parses a stable snapshot.
         byte[] ownedChunk = (byte[])chunk.Clone();
 
-        // TryWrite returns false when the channel is full (FullMode = Wait).
-        // This prevents the serial callback thread from blocking and allows
-        // upper layers to recover by reopening the port.
-        if (!_rxChannel.Writer.TryWrite((gen, ownedChunk)))
-        {
-            // Schedule overflow recovery at most once per generation so a burst
-            // of rejected chunks cannot queue a swarm of untracked Close() tasks,
-            // and a delayed task cannot close a session that has already reopened.
-            bool schedule = false;
-            lock (_sync)
-            {
-                if (!_disposed && _open && gen == _generation && _recoveryGeneration != gen)
-                {
-                    _recoveryGeneration = gen;
-                    schedule = true;
-                }
-            }
-            if (schedule)
-            {
-                // Leave the serial driver's callback thread before closing.
-                _ = Task.Run(() => RecoverFromOverflow(gen));
-            }
-        }
-    }
-
-    /// <summary>
-    /// Closes the port after the receive queue filled up, so the link supervisor
-    /// reconnects into a clean session rather than the wrapper silently dropping
-    /// bytes and corrupting frame reassembly.
-    /// </summary>
-    private void RecoverFromOverflow(int gen)
-    {
-        // The generation is validated INSIDE CloseInternal, under the same _sync
-        // acquisition that performs the close. This deliberately does not take
-        // _sync here first: nesting the two would make Close()'s Monitor.Wait run
-        // at recursion depth 2, and whether Wait releases every level or only one
-        // is a subtlety not worth depending on.
-        bool closed = CloseInternal(expectedGeneration: gen);
-
-        // Two separate facts, and the log must not conflate them. The overflow
-        // itself always happened — that is why we are here, and a slow
-        // BytesReceived handler is a cause nobody can guess after the fact. But
-        // the close only happens when this generation is still the live one, so
-        // announcing one unconditionally would report a port teardown that never
-        // occurred, during exactly the incident this logging exists to explain.
-        if (closed)
-        {
-            Logger.Warn(this, $"SerialPortWrapper: receive queue full on generation {gen} - closed the port " +
-                              "to force a reconnect. A BytesReceived handler is not keeping up.");
-        }
-        else
-        {
-            Logger.Warn(this, $"SerialPortWrapper: receive queue filled up on generation {gen}, which has " +
-                              "already been closed or replaced - no action taken. A BytesReceived handler " +
-                              "is not keeping up.");
-        }
-    }
-
-    /// <summary>
-    /// Forwards each chunk from <see cref="_rxChannel"/> to
-    /// <see cref="_callbackChannel"/> in arrival order. Runs for the lifetime of
-    /// the wrapper and exits only when the channel is completed by Dispose().
-    /// </summary>
-    private async Task DispatchLoopAsync()
-    {
-        try
-        {
-            await foreach (var item in _rxChannel.Reader.ReadAllAsync().ConfigureAwait(false))
-            {
-                await _callbackChannel.Writer.WriteAsync(item).ConfigureAwait(false);
-            }
-        }
-        catch (ChannelClosedException)
-        {
-            // Channel closed during disposal.
-        }
-        finally
-        {
-            // Let the callback loop terminate once the last forwarded item drains.
-            _callbackChannel.Writer.TryComplete();
-        }
+        // Never blocks and only fails once the channel is completed at shutdown,
+        // so the driver's callback thread is not held up.
+        _rxChannel.Writer.TryWrite((gen, ownedChunk));
     }
 
     /// <summary>
@@ -295,7 +196,7 @@ public class SerialPortWrapper : ISerialPort
     {
         try
         {
-            await foreach (var item in _callbackChannel.Reader.ReadAllAsync().ConfigureAwait(false))
+            await foreach (var item in _rxChannel.Reader.ReadAllAsync().ConfigureAwait(false))
             {
                 bool deliver;
                 lock (_sync)
@@ -361,44 +262,19 @@ public class SerialPortWrapper : ISerialPort
             _port.Open();
 
             // New session: bump the generation so any chunk still queued from a
-            // previous session is dropped by the callback loop, then drain the
-            // queues so stale bytes don't linger.
+            // previous session is dropped by the consumer.
             _generation++;
-            _recoveryGeneration = -1;
             _open = true;
-            DrainQueues();
         }
     }
 
     /// <inheritdoc/>
-    public void Close() => CloseInternal(expectedGeneration: null);
-
-    /// <summary>
-    /// Ends the current session.
-    /// </summary>
-    /// <param name="expectedGeneration">
-    /// When supplied, the close only proceeds if it still names the active
-    /// session. Overflow recovery runs on a queued task, so by the time it gets
-    /// scheduled a Close()+Open() may already have replaced the session that
-    /// overflowed; tearing that newer one down would be a spurious link drop.
-    /// The check shares this method's <c>_sync</c> acquisition with the close
-    /// itself, so no Close/Open can interleave between the two.
-    /// </param>
-    /// <returns>
-    /// True when this call actually tore the session down; false when there was
-    /// nothing open, or when <paramref name="expectedGeneration"/> named a session
-    /// that has already gone. Callers that log must distinguish the two: reporting
-    /// a teardown that never happened is worse than saying nothing.
-    /// </returns>
-    private bool CloseInternal(int? expectedGeneration)
+    public void Close()
     {
         lock (_sync)
         {
             if (!_open)
-                return false;
-
-            if (expectedGeneration.HasValue && expectedGeneration.Value != _generation)
-                return false;   // the session this call refers to is already gone
+                return;
 
             // Close the session for new work FIRST. WaitForCallbackLease() parks
             // in Monitor.Wait, which releases _sync; leaving _open true across
@@ -406,41 +282,36 @@ public class SerialPortWrapper : ISerialPort
             // is already going away.
             _open = false;
 
-            // Claim the teardown for the whole of the rest of this method, so no
-            // Open() can publish a new session while we are parked below.
+            // Claim the teardown for the rest of this method, so no Open() can
+            // publish a new session while we are parked below.
             _closing = true;
             try
             {
                 // Wait for any callback already admitted for delivery to finish
-                // before invalidating the session, so its chunk cannot land in a
-                // session that a later Open() would create. Skipped when we are ON
-                // the callback thread (a handler calling Close()) — that would
+                // before invalidating the session. Skipped when we are ON the
+                // callback thread (a handler calling Close()) — that would
                 // self-deadlock.
                 WaitForCallbackLease();
 
                 // Invalidate the just-ended session so any chunk still in flight is
-                // dropped by the callback loop instead of delivered after Close().
+                // dropped by the consumer instead of delivered after Close().
                 _generation++;
 
                 // Never swallowed: a failing Close() can leave the OS handle open
                 // while this wrapper reports closed, and the next Close() returns
-                // immediately because _open is already false. Dispose() captures and
-                // rethrows its teardown error, so at minimum make this one visible.
+                // immediately because _open is already false. Dispose() captures
+                // and rethrows its teardown error, so at minimum make this visible.
                 try { if (_port.IsOpen) _port.Close(); }
                 catch (Exception ex)
                 {
                     Logger.Warn(this, $"SerialPortWrapper: underlying port Close() failed - {ex.GetType().Name}: {ex.Message}");
                 }
-
-                DrainQueues();
             }
             finally
             {
                 _closing = false;
                 Monitor.PulseAll(_sync);   // wake any Open() waiting this out
             }
-
-            return true;
         }
     }
 
@@ -546,9 +417,9 @@ public class SerialPortWrapper : ISerialPort
             // Unsubscribe first to prevent new chunks from arriving.
             _port.BytesReceived -= OnBytesReceived;
 
-            // Complete the pipeline even if the port teardown throws, so both
-            // lifetime tasks are guaranteed to terminate. Capture the error and
-            // rethrow it only after the coordinated teardown below.
+            // Complete the channel even if the port teardown throws, so the
+            // consumer is guaranteed to terminate. Capture the error and rethrow
+            // it only after the coordinated teardown below.
             try
             {
                 try { _port.Close(); } catch { }
@@ -560,8 +431,6 @@ public class SerialPortWrapper : ISerialPort
             }
             finally
             {
-                // DispatchLoopAsync then completes the callback channel in its
-                // finally block, so both loops terminate.
                 _rxChannel.Writer.TryComplete();
             }
         }
@@ -570,34 +439,22 @@ public class SerialPortWrapper : ISerialPort
         // ALREADY executing on _callbackTask — waiting on it would block until the
         // handler returns (i.e. always hit the timeout) and cannot achieve
         // coordinated termination. Skip the synchronous wait in that case; the
-        // loops terminate on their own once the completed channels drain.
+        // consumer terminates on its own once the completed channel drains.
         bool onCallbackThread = Volatile.Read(ref _callbackThreadId) == Environment.CurrentManagedThreadId;
 
         if (!onCallbackThread)
         {
-            // Wait for the loops OUTSIDE _sync: the callback loop takes _sync for its
+            // Wait for the consumer OUTSIDE _sync: it takes _sync for its
             // generation check, so holding it here would deadlock.
             try
             {
-                Task.WaitAll(new[] { _rxDispatchTask, _callbackTask }, 2000);
+                _callbackTask.Wait(2000);
             }
             catch (AggregateException) { }
         }
 
-        lock (_sync)
-        {
-            DrainQueues();
-        }
-
         if (disposeError != null)
             System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(disposeError).Throw();
-    }
-
-    /// <summary>Drains both channels. Caller must hold <c>_sync</c>.</summary>
-    private void DrainQueues()
-    {
-        while (_callbackChannel.Reader.TryRead(out _)) { }
-        while (_rxChannel.Reader.TryRead(out _)) { }
     }
 
     /// <summary>

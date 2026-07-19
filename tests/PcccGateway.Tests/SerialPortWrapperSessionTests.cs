@@ -15,17 +15,6 @@ public class SerialPortWrapperSessionTests
 {
     private const int WaitMs = 3000;
 
-    private static bool SpinUntil(Func<bool> condition, int timeoutMs = WaitMs)
-    {
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        while (sw.ElapsedMilliseconds < timeoutMs)
-        {
-            if (condition()) return true;
-            Thread.Sleep(10);
-        }
-        return condition();
-    }
-
     // ─── Session gating ──────────────────────────────────────────────────────
 
     [Fact]
@@ -225,106 +214,62 @@ public class SerialPortWrapperSessionTests
         Assert.True(wrapper.IsOpen);
     }
 
-    // ─── Receive queue overflow ──────────────────────────────────────────────
+    // ─── Teardown / reopen race ──────────────────────────────────────────────
 
     [Fact]
-    public void ReceiveQueueOverflow_ClosesThePort()
+    public async Task Open_DoesNotPublishASessionWhileACloseIsParked()
     {
-        // Both channels are bounded at 100. Blocking the one consumer lets the
-        // pipeline fill (≈202 chunks buffered), after which TryWrite fails and
-        // overflow recovery closes the session so the link supervisor reconnects
-        // into a clean one rather than the wrapper silently dropping bytes.
+        // Close() clears _open, then parks in WaitForCallbackLease waiting for the
+        // running handler. Monitor.Wait releases _sync there, and at that moment
+        // the teardown is only half done: _open is already false but the
+        // generation has not been bumped and the port is still open.
+        //
+        // Without the _closing marker, an Open() arriving in that window sees
+        // _open == false, publishes a whole new session, and the parked Close then
+        // wakes up, bumps the generation and shuts the port the new session is
+        // using — leaving the wrapper closed while its owner believes it is open.
+        //
+        // This race needs no overflow; a plain Close/Open pair reaches it. It was
+        // originally found through the overflow-recovery path, which has since
+        // been removed, so it is provoked directly here.
         var port = new FakeSerialPort();
         using var wrapper = new SerialPortWrapper(port);
         wrapper.Open();
 
-        var release = new ManualResetEventSlim(false);
         var handlerEntered = new ManualResetEventSlim(false);
-        wrapper.BytesReceived += (_, _) =>
+        var release = new ManualResetEventSlim(false);
+        EventHandler<byte[]> blocking = (_, _) =>
         {
             handlerEntered.Set();
             release.Wait(WaitMs);
         };
-
-        port.SimulateReceive(new byte[] { 0x00 });
-        Assert.True(handlerEntered.Wait(WaitMs), "The first chunk was never delivered.");
-
-        for (int i = 0; i < 400; i++)
-            port.SimulateReceive(new byte[] { (byte)i });
-
-        // Recovery parks in WaitForCallbackLease until the blocked handler returns.
-        release.Set();
-
-        Assert.True(SpinUntil(() => !wrapper.IsOpen),
-            "The port was not closed after the receive queue overflowed.");
-    }
-
-    [Fact]
-    public void ReopenAfterOverflow_AcceptsChunksAgain()
-    {
-        // Open() resets _recoveryGeneration, so a session that follows an overflow
-        // is not left permanently marked as already-recovered.
-        var port = new FakeSerialPort();
-        using var wrapper = new SerialPortWrapper(port);
-        wrapper.Open();
-
-        var release = new ManualResetEventSlim(false);
-        var entered = new ManualResetEventSlim(false);
-        EventHandler<byte[]> blocking = (_, _) => { entered.Set(); release.Wait(WaitMs); };
         wrapper.BytesReceived += blocking;
 
-        port.SimulateReceive(new byte[] { 0x00 });
-        Assert.True(entered.Wait(WaitMs));
-        for (int i = 0; i < 400; i++)
-            port.SimulateReceive(new byte[] { (byte)i });
+        port.SimulateReceive(new byte[] { 0x01 });
+        Assert.True(handlerEntered.Wait(WaitMs), "The handler never ran.");
+
+        // Close parks on the lease held by that handler.
+        var closing = Task.Run(() => wrapper.Close());
+        await Task.Delay(100);
+
+        // Open must wait this out rather than publishing over a half-torn session.
+        var opening = Task.Run(() => wrapper.Open());
+        await Task.Delay(100);
+
+        wrapper.BytesReceived -= blocking;
         release.Set();
 
-        Assert.True(SpinUntil(() => !wrapper.IsOpen), "Overflow did not close the port.");
-        wrapper.BytesReceived -= blocking;
+        await closing.WaitAsync(TimeSpan.FromMilliseconds(WaitMs));
+        await opening.WaitAsync(TimeSpan.FromMilliseconds(WaitMs));
 
-        // A fresh session must work normally.
-        port.Open();                     // the fake's own flag, cleared by the close
-        wrapper.Open();
-        Assert.True(wrapper.IsOpen);
+        Assert.True(wrapper.IsOpen,
+            "The parked Close() tore down the session Open() had already published.");
 
+        // And the reopened session must actually work.
         var got = new ManualResetEventSlim(false);
         wrapper.BytesReceived += (_, _) => got.Set();
         port.SimulateReceive(new byte[] { 0x7F });
 
         Assert.True(got.Wait(WaitMs), "The reopened session did not deliver chunks.");
-    }
-
-    [Fact]
-    public void OverflowRecovery_DoesNotCloseASessionThatWasAlreadyReplaced()
-    {
-        // Recovery runs on a queued task, so the session it refers to may already
-        // have been closed and reopened by the time it executes. CloseInternal's
-        // generation check is what stops it tearing down the newer one.
-        var port = new FakeSerialPort();
-        using var wrapper = new SerialPortWrapper(port);
-        wrapper.Open();
-
-        var release = new ManualResetEventSlim(false);
-        var entered = new ManualResetEventSlim(false);
-        EventHandler<byte[]> blocking = (_, _) => { entered.Set(); release.Wait(WaitMs); };
-        wrapper.BytesReceived += blocking;
-
-        port.SimulateReceive(new byte[] { 0x00 });
-        Assert.True(entered.Wait(WaitMs));
-        for (int i = 0; i < 400; i++)
-            port.SimulateReceive(new byte[] { (byte)i });
-
-        // Replace the session while recovery is still queued or parked.
-        wrapper.BytesReceived -= blocking;
-        release.Set();
-        wrapper.Close();
-        port.Open();
-        wrapper.Open();
-
-        // Give any stale recovery task time to run and do damage.
-        Thread.Sleep(300);
-
-        Assert.True(wrapper.IsOpen,
-            "A stale overflow recovery closed a session that had already been replaced.");
     }
 }
