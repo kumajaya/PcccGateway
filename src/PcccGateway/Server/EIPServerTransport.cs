@@ -102,7 +102,15 @@ public partial class EIPServerTransport : IServerTransport, IDisposable
 
     private UdpClient? _udpListener;
     private Task?      _udpTask;
-    // Cached local unicast IP address for ListIdentity responses
+    // Fallback local address for ListIdentity, resolved once at startup.
+    //
+    // NOT the primary source: both ListIdentity paths now derive the address from
+    // the request itself, because "the machine's IPv4 address" is not a
+    // well-defined thing on a multi-homed host. Enumerating interfaces returns
+    // whichever one happens to come first, and on Windows that is regularly a
+    // Hyper-V, WSL, VPN or VirtualBox adapter — leaving RSLinx with an address it
+    // discovered the gateway on but cannot connect to. This value is used only
+    // when the per-request lookup fails.
     private IPAddress? _cachedLocalAddress;
 
     // ── Lifecycle ────────────────────────────────────────────────────────────
@@ -281,10 +289,19 @@ public partial class EIPServerTransport : IServerTransport, IDisposable
             // The health monitor is activated when logging disabled
             SetHealthStatsEnabled(!Logger.Enabled);
 
-            // Cache local IP address once at startup (avoid repeated enumeration)
-            _cachedLocalAddress = GetLocalUnicastIPv4Address() ?? IPAddress.Loopback;
-            if (_cachedLocalAddress == null)
-                Logger.Info(this, "No valid IPv4 unicast address found for ListIdentity");
+            // Resolve the fallback address. The check has to happen BEFORE the
+            // loopback substitution: the previous form tested the result of
+            // `?? IPAddress.Loopback`, which can never be null, so the warning
+            // never fired and the transport silently advertised 127.0.0.1 — an
+            // address no remote client can reach.
+            IPAddress? fallback = GetLocalUnicastIPv4Address();
+            if (fallback == null)
+            {
+                Logger.Warn(this, "No routable IPv4 address found; ListIdentity will fall back to " +
+                                  "loopback and remote clients will not be able to connect");
+                fallback = IPAddress.Loopback;
+            }
+            _cachedLocalAddress = fallback;
 
             Logger.Info(this, $"EtherNet/IP transport started on TCP/UDP port {_port}");
         }
@@ -603,9 +620,12 @@ public partial class EIPServerTransport : IServerTransport, IDisposable
                 ushort cmd = (ushort)(data[0] | (data[1] << 8));
                 if (cmd != EIP_LIST_IDENTITY) continue;
 
-                // Use cached local IP address (avoid per-packet enumeration)
-                if (_cachedLocalAddress == null) return;
-                IPEndPoint localEndpoint = new IPEndPoint(_cachedLocalAddress, _port);
+                // Advertise the address that faces THIS sender, not whichever
+                // interface happens to enumerate first.
+                IPAddress? local = GetLocalAddressFacing(result.RemoteEndPoint.Address)
+                                  ?? _cachedLocalAddress;
+                if (local == null) continue;
+                IPEndPoint localEndpoint = new IPEndPoint(local, _port);
 
                 // Echo the Sender Context from the request (bytes 12-19).
                 ulong senderCtx = BitConverter.ToUInt64(data, 12);
@@ -825,7 +845,67 @@ public partial class EIPServerTransport : IServerTransport, IDisposable
     }
 
     /// <summary>
+    /// Returns the local IPv4 address the OS would use to reach
+    /// <paramref name="remote"/>, or null if that cannot be determined.
+    /// </summary>
+    /// <remarks>
+    /// Connect() on a UDP socket sends nothing — it only binds the socket to the
+    /// route the kernel picks for that destination, after which LocalEndPoint
+    /// holds the source address. That is the address the peer must be told to
+    /// come back to, and it is correct on a multi-homed host where enumerating
+    /// interfaces is not.
+    ///
+    /// Loopback is returned rather than rejected. This answers "which address did
+    /// this sender reach us on", and for a sender on this machine that answer IS
+    /// loopback — traffic arriving from 127.0.0.1 cannot have originated
+    /// elsewhere. Substituting a LAN address there would hand a local client an
+    /// address it never used. The non-loopback filter belongs to
+    /// <see cref="GetLocalUnicastIPv4Address"/>, which answers the different
+    /// question of how this machine presents itself to the outside.
+    /// </remarks>
+    private static IPAddress? GetLocalAddressFacing(IPAddress remote)
+    {
+        if (remote.AddressFamily != AddressFamily.InterNetwork)
+            return null;
+
+        try
+        {
+            using var probe = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+            probe.Connect(remote, 9);   // discard port; no traffic is generated
+            IPAddress? local = (probe.LocalEndPoint as IPEndPoint)?.Address;
+            return local?.AddressFamily == AddressFamily.InterNetwork ? local : null;
+        }
+        catch
+        {
+            return null;   // no route, or the socket was refused; caller falls back
+        }
+    }
+
+    /// <summary>
+    /// Normalises a socket endpoint to a usable IPv4 address, unwrapping the
+    /// IPv6-mapped form a dual-stack listener reports.
+    /// </summary>
+    /// <remarks>
+    /// Loopback is preserved, not filtered out. The caller is asking which address
+    /// a client actually reached us on, and for a client on this machine that is
+    /// 127.0.0.1 — an address it can certainly route to, unlike the LAN address
+    /// that would otherwise be substituted for it. Only the fallback discovery in
+    /// <see cref="GetLocalUnicastIPv4Address"/> filters loopback, because it is
+    /// answering a different question.
+    /// </remarks>
+    internal static IPAddress? ToIPv4(System.Net.EndPoint? endpoint)
+    {
+        if (endpoint is not IPEndPoint ip) return null;
+
+        IPAddress addr = ip.Address;
+        if (addr.IsIPv4MappedToIPv6) addr = addr.MapToIPv4();
+
+        return addr.AddressFamily == AddressFamily.InterNetwork ? addr : null;
+    }
+
+    /// <summary>
     /// Gets the first non-loopback IPv4 unicast address of the local machine.
+    /// Used only as a fallback — see <see cref="_cachedLocalAddress"/>.
     /// </summary>
     private IPAddress? GetLocalUnicastIPv4Address()
     {
@@ -1434,14 +1514,16 @@ public sealed partial class EIPServerTransport
         /// <param name="context">Request context (contains Sender Context for echo)</param>
         private async Task HandleListIdentity(EIPRequestContext context)
         {
-            // Use cached local IP address (avoid per-packet enumeration)
-            if (_transport._cachedLocalAddress == null)
+            // No guessing needed here: this connection's own local endpoint IS the
+            // address this client reached us on, and therefore the one to advertise.
+            IPAddress? local = ToIPv4(_tcp.Client.LocalEndPoint) ?? _transport._cachedLocalAddress;
+            if (local == null)
             {
-                Logger.Info(this, "[WARN] HandleListIdentity: no valid IPv4 unicast address found");
+                Logger.Warn(this, "HandleListIdentity: no usable IPv4 address to advertise");
                 return;
             }
 
-            IPEndPoint localEndpoint = new IPEndPoint(_transport._cachedLocalAddress, _transport._port);
+            IPEndPoint localEndpoint = new IPEndPoint(local, _transport._port);
             byte[] reply = _transport.BuildListIdentityResponse(context.SenderContext, _sessionHandle, localEndpoint);
             await SendRawResponse(reply, reply.Length).ConfigureAwait(false);
             Logger.Info(this, $"ListIdentity response sent");
