@@ -185,6 +185,7 @@ public partial class EIPServerTransport : IServerTransport, IDisposable
 
     private const byte CIP_STATUS_OK       = 0x00; // Success
     private const byte CIP_STATUS_FRAGMENT = 0x06; // Fragmented reply (more data follows)
+    private const byte CIP_STATUS_SVC_UNSUPPORTED = 0x08; // Service not supported on this object
 
     // ── Forward Open / connection parameters ────────────────────────────────
 
@@ -1058,6 +1059,18 @@ public sealed partial class EIPServerTransport
         public uint AssignedId { get; set; }
 
         /// <summary>
+        /// Originator vendor ID from the Forward Open request. Part of the triple
+        /// that identifies a connection uniquely; see HandleForwardClose.
+        /// </summary>
+        public ushort OriginatorVendorId { get; set; }
+
+        /// <summary>
+        /// Originator serial number from the Forward Open request. Part of the
+        /// triple that identifies a connection uniquely; see HandleForwardClose.
+        /// </summary>
+        public uint OriginatorSerial { get; set; }
+
+        /// <summary>
         /// Connection serial number from the Forward Open request.
         /// Used to identify the connection in Forward Close.
         /// </summary>
@@ -1761,6 +1774,21 @@ public sealed partial class EIPServerTransport
                         return;
                     }
 
+                    // The Connected Address Item carries the connection ID and is
+                    // where that ID is checked against the ones we issued. CPF puts it
+                    // before the data item, and this loop follows arrival order — so a
+                    // packet that sends the data item first would reach the dispatch
+                    // below having skipped that check entirely, execute the PCCC command
+                    // (writes included), and then have its reply built as unconnected
+                    // because no connection was ever attached. Require the check to have
+                    // happened.
+                    if (context.Connection == null)
+                    {
+                        Logger.Warn(this, "Connected Send: data item arrived before a valid " +
+                                          "Connected Address Item - dropping");
+                        return;
+                    }
+
                     // Read incoming sequence number (can be used for validation)
                     ushort incomingSeq = (ushort)(buf[offset] | (buf[offset + 1] << 8));
                     _ = incomingSeq;
@@ -1849,6 +1877,8 @@ public sealed partial class EIPServerTransport
                 OrigConnectionId = toConnId,
                 AssignedId = newId,
                 SerialNumber = connSerial,
+                OriginatorVendorId = vendorId,
+                OriginatorSerial = serialNum,
                 SequenceNumber = 0,
                 IsActive = true
             };
@@ -1889,24 +1919,46 @@ public sealed partial class EIPServerTransport
         /// </summary>
         private async Task HandleForwardClose(byte[] buf, int offset, ushort length, EIPRequestContext context)
         {
+            // Bounded by the declared CIP item, not by the receive buffer. The
+            // buffer is reused across packets, so checking only buf.Length let a
+            // short or malformed Forward Close read its serial number and vendor
+            // fields out of whatever the previous packet had left behind — and
+            // those fields decide which connection gets closed. Forward Open has
+            // always done it this way; this handler took `length` and ignored it.
+            int requestEnd = offset + length;
+            if (requestEnd > buf.Length) return;
+
             offset++;  // skip service code byte (0x4E)
-            if (offset >= buf.Length) return;
+            if (offset >= requestEnd) return;
 
             byte pathSize = buf[offset++];
+            if (offset + pathSize * 2 > requestEnd)
+            {
+                Logger.Warn(this, "Forward Close: pathSize exceeds buffer - dropping");
+                return;
+            }
             offset += pathSize * 2;
 
-            if (offset + 10 > buf.Length) return;
+            if (offset + 10 > requestEnd) return;
             _ = buf[offset++]; // secsPerTick
             _ = buf[offset++]; // timeoutTicks
             ushort connSerial = ReadU16(buf, ref offset);
             ushort vendorId   = ReadU16(buf, ref offset);
             uint   serialNum  = ReadU32(buf, ref offset);
 
-            // Find connection by serial number
+            // Match on the full originator triple, not the serial number alone.
+            // CIP specifies connection serial + vendor ID + originator serial
+            // together precisely because the serial is chosen by the originator and
+            // is only unique within it; a client holding two connections that
+            // happen to share a serial would otherwise close whichever this lookup
+            // reached first.
             CipConnection? conn = null;
             lock (_connLock)
             {
-                conn = _connections.Values.FirstOrDefault(c => c.SerialNumber == connSerial);
+                conn = _connections.Values.FirstOrDefault(c =>
+                    c.SerialNumber       == connSerial &&
+                    c.OriginatorVendorId == vendorId &&
+                    c.OriginatorSerial   == serialNum);
                 if (conn != null)
                     _connections.Remove(conn.AssignedId);
             }
@@ -1939,12 +1991,31 @@ public sealed partial class EIPServerTransport
             long lenPos    = ms.Position; w.Write((ushort)0);
             long dataStart = ms.Position;
 
-            byte replySvc = (byte)(((serviceCode == CIP_SERVICE_GET_ATTRIBUTES_ALL) ? 0x01 : 0x0E) | 0x80);
+            bool isGetAll = serviceCode == CIP_SERVICE_GET_ATTRIBUTES_ALL;
+            byte replySvc = (byte)((isGetAll ? 0x01 : 0x0E) | 0x80);
             w.Write(replySvc);
             w.Write((byte)0x00);       // Reserved
-            w.Write(CIP_STATUS_OK);
-            w.Write((byte)0x00);       // Additional status size = 0
-            w.Write(_transport._identityData);   // Identity attributes payload
+
+            if (isGetAll)
+            {
+                w.Write(CIP_STATUS_OK);
+                w.Write((byte)0x00);   // Additional status size = 0
+                w.Write(_transport._identityData);   // Identity attributes payload
+            }
+            else
+            {
+                // Get Attribute Single asks for ONE attribute. _identityData is a
+                // single opaque GetAttributesAll payload, so there is nothing here to
+                // select from; the previous code returned the whole blob under a
+                // success status, telling the client "here is your attribute" and
+                // handing it all of them. A client parsing that reply gets garbage and
+                // no indication why. Say we do not implement the service instead —
+                // if a client ever needs it, this status is what will show up.
+                Logger.Info(this, $"Get Attribute Single (0x{serviceCode:X2}) is not implemented - " +
+                                  "replying with CIP status 0x08");
+                w.Write(CIP_STATUS_SVC_UNSUPPORTED);
+                w.Write((byte)0x00);   // Additional status size = 0
+            }
 
             long dataEnd = ms.Position;
             ms.Seek(lenPos, SeekOrigin.Begin);
