@@ -19,10 +19,23 @@ public class TransportLifecycleTests
     }
 
     /// <summary>
-    /// Simple TCP echo server that can handle basic CSPv4 handshake.
-    /// For EIP, it just echoes raw bytes. For CSP, it detects the RegisterSession
-    /// request (mode=0x01, submode=0x01) and changes the first byte to 0x02
-    /// (MODE_RESPONSE) so the client accepts the response.
+    /// Simple TCP echo server that can complete the CSPv4 and EIP handshakes.
+    /// A verbatim echo is not a valid reply for either protocol, so the two
+    /// fields a real device would not echo back are patched:
+    /// <list type="bullet">
+    ///   <item>
+    ///     CSP: the RegisterSession request (mode=0x01, submode=0x01) has its
+    ///     first byte changed to 0x02 (MODE_RESPONSE) and is given a non-zero
+    ///     connection ID in bytes 4-7, as a real server would assign.
+    ///   </item>
+    ///   <item>
+    ///     EIP: the RegisterSession request (command 0x0065) carries a zero
+    ///     session handle, because the handle is what it is asking for. A real
+    ///     device assigns a non-zero one in bytes 4-7 of the reply, so a
+    ///     non-zero handle is written here.
+    ///   </item>
+    /// </list>
+    /// Everything else is echoed unchanged.
     /// </summary>
     private sealed class EchoServer : IDisposable
     {
@@ -58,6 +71,13 @@ public class TransportLifecycleTests
             }
         }
 
+        /// <summary>
+        /// Both the CSPv4 and the EIP RegisterSession request are exactly 28
+        /// bytes (EIP: 24-byte header + 4-byte payload; CSP: a bare 28-byte
+        /// header).
+        /// </summary>
+        private const int RegisterRequestLen = 28;
+
         private async Task HandleClientAsync(TcpClient client, CancellationToken ct)
         {
             try
@@ -66,24 +86,70 @@ public class TransportLifecycleTests
                 {
                     var stream = client.GetStream();
                     var buffer = new byte[4096];
+
+                    // TCP preserves no message boundaries: ReadAsync may hand back
+                    // the handshake in fragments. Patching a fragment would echo an
+                    // unmodified header — and for EIP a zero session handle — while
+                    // the following read no longer starts at the command byte. So
+                    // the whole request is collected before it is inspected.
+                    int read = await ReadAtLeastAsync(stream, buffer, RegisterRequestLen, ct);
+                    if (read == 0) return;
+
+                    // CSP RegisterSession (mode=0x01, submode=0x01): change the mode
+                    // byte to 0x02 (response), and assign a connection ID in bytes 4-7
+                    // (big-endian). The request carries zero because that is what it is
+                    // asking for; echoing the zero back would let every later frame match
+                    // on 0 == 0 and hide a transport that never stored the assigned ID.
+                    if (read >= 28 && buffer[0] == 0x01 && buffer[1] == 0x01)
+                    {
+                        buffer[0] = 0x02;
+                        buffer[4] = 0x00;
+                        buffer[5] = 0x00;
+                        buffer[6] = 0x00;
+                        buffer[7] = 0x01;
+                    }
+
+                    // EIP RegisterSession (command 0x0065): a real device replies with
+                    // a non-zero session handle in bytes 4-7. Echoing the request
+                    // verbatim returns zero, which no device ever does.
+                    if (read >= 24 && buffer[0] == 0x65 && buffer[1] == 0x00)
+                    {
+                        buffer[4] = 0x01;
+                        buffer[5] = 0x00;
+                        buffer[6] = 0x00;
+                        buffer[7] = 0x00;
+                    }
+
+                    await stream.WriteAsync(buffer, 0, read, ct);
+
+                    // Everything after the handshake is echoed verbatim.
                     while (!ct.IsCancellationRequested)
                     {
-                        int read = await stream.ReadAsync(buffer, 0, buffer.Length, ct);
-                        if (read == 0) break;
-
-                        // If this looks like a CSP RegisterSession request (mode=0x01, submode=0x01),
-                        // change the mode byte to 0x02 (response) so the client accepts it.
-                        if (read >= 28 && buffer[0] == 0x01 && buffer[1] == 0x01)
-                        {
-                            buffer[0] = 0x02;
-                        }
-
-                        // Echo back what was received (with the mode adjusted if CSP).
-                        await stream.WriteAsync(buffer, 0, read, ct);
+                        int n = await stream.ReadAsync(buffer, 0, buffer.Length, ct);
+                        if (n == 0) break;
+                        await stream.WriteAsync(buffer, 0, n, ct);
                     }
                 }
             }
             catch { /* client disconnected */ }
+        }
+
+        /// <summary>
+        /// Reads until at least <paramref name="count"/> bytes have arrived, or
+        /// the peer closes. May return more when reads coalesce; the caller
+        /// echoes exactly what was received.
+        /// </summary>
+        private static async Task<int> ReadAtLeastAsync(
+            NetworkStream stream, byte[] buffer, int count, CancellationToken ct)
+        {
+            int total = 0;
+            while (total < count)
+            {
+                int n = await stream.ReadAsync(buffer, total, buffer.Length - total, ct);
+                if (n == 0) break;
+                total += n;
+            }
+            return total;
         }
 
         public void Dispose()

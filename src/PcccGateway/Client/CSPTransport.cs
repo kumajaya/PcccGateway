@@ -17,8 +17,6 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 using System.Net.Sockets;
-using System.Buffers;
-using PcccGateway.Interface;
 using PcccGateway.Common;
 
 namespace PcccGateway.Client;
@@ -29,7 +27,7 @@ namespace PcccGateway.Client;
 /// Connects to a remote CSPv4 device (PLC-5E, SLC 5/05, SoftLogix 5, or a
 /// gateway such as the 1761-NET-ENI) on TCP port 2222 — Allen-Bradley's
 /// legacy "AB/Ethernet" PCCC transport, as opposed to CIP-encapsulated PCCC
-/// on TCP/44818 which <see cref="EIPServer"/> handles.
+/// on TCP/44818 which <see cref="EIPTransport"/> handles.
 ///
 /// ============================================================================
 /// FRAME FORMAT — confirmed against kevinherron/wireshark-cspv4-pccc
@@ -97,19 +95,14 @@ namespace PcccGateway.Client;
 /// limitations, not transport-related.
 /// ============================================================================
 ///
-/// Send/receive are decoupled, mirroring <see cref="EIPServer"/>:
-/// <see cref="SendFrame"/> fires and forgets; the background receive loop
-/// raises <see cref="FrameReceived"/> for every inbound PCCC frame. The
-/// <see cref="PCCCComm"/> application layer matches responses to outstanding
-/// requests by TNS (transaction number).
+/// Send/receive are decoupled: <see cref="SendFrame"/> fires and forgets; the
+/// background receive loop raises <see cref="FrameReceived"/> for every inbound
+/// PCCC frame. The application layer matches responses to outstanding requests
+/// by TNS (transaction number).
 ///
-/// A read timeout is applied only after the header is fully received,
-/// preventing idle connections from being disconnected every 10 seconds.
-/// Waiting for the first byte of a new packet is done using the
-/// lifecycle token, which is cancelled during shutdown to allow graceful
-/// termination without hanging.
+/// Thread safety and the event model are provided by <see cref="TCPBaseTransport"/>.
 /// </summary>
-public class CSPTransport : ITransport
+public class CSPTransport : TCPBaseTransport
 {
     // ── CSPv4 header field values ────────────────────────────────────────────
     private const byte MODE_REQUEST  = 0x01;
@@ -121,8 +114,13 @@ public class CSPTransport : ITransport
     private const uint CSP_STATUS_OK = 0x00000000;
 
     // ── Layout constants ──────────────────────────────────────────────────────
-    private const int CSPHeaderLen   = 28;
-    private const int LsapLocalLen   = 4;
+    private const int CSPHeaderLen = 28;
+    private const int LsapLocalLen = 4;
+
+    private const byte LSAP_FORM_LOCAL = 0x00;
+
+    /// <summary>Minimum PCCC content: CMD, STS and the two TNS bytes.</summary>
+    private const int MinPcccLen = 4;
 
     /// <summary>
     /// LSAP "control" byte sent on every request. VERIFY: meaning still
@@ -133,42 +131,9 @@ public class CSPTransport : ITransport
     /// the default here stays 0x00 rather than copying that value blindly.
     /// Change via the constructor if a specific target requires it.
     /// </summary>
-    private readonly byte LsapControlByte;
+    private readonly byte _lsapControlByte;
 
     public const int DefaultPort = 2222;
-
-    private readonly string _host;
-    private readonly int    _port;
-    private readonly int    _connectTimeoutMs;
-
-    private TcpClient?     _tcp;
-    private NetworkStream? _stream;
-    private uint           _connId;
-    private bool           _disposed;
-
-    // Serialises all writes to the stream (both registration and SendFrame).
-    private readonly object _sendLock = new object();
-
-    private readonly object _closeLock = new object();
-    private bool _isClosed = false;
-
-    private CancellationTokenSource? _rxCts;
-    private Task? _rxTask;
-
-    // Lifecycle token for graceful shutdown - cancels idle reads waiting for first byte.
-    // Recreated on each Open() so that reconnection works after Close().
-    private CancellationTokenSource? _lifecycleCts;
-    private CancellationToken _lifecycleToken;
-
-    public event EventHandler<byte[]>? FrameReceived;
-    public event EventHandler<byte[]>? RawFrameSent;
-    public event EventHandler<byte[]>? RawFrameReceived;
-
-    /// <summary>
-    /// Returns true when the TCP connection is established and the transport
-    /// has not been disposed.
-    /// </summary>
-    public bool IsOpen => _tcp?.Connected == true && !_disposed;
 
     // First 4 context bytes on the REGISTER frame (Connection submode).
     // This exact value is REQUIRED by real PLC-5/40E (1785-L40E) hardware:
@@ -179,6 +144,13 @@ public class CSPTransport : ITransport
     // bytes is still unknown, but the value is not arbitrary — do not change it.
     private static readonly byte[] RegisterContextPrefix = { 0x00, 0x04, 0x00, 0x05 };
 
+    // Ensures the routed-LSAP notice is logged once per transport rather than on
+    // every frame: on a DH+ network every single reply would otherwise log.
+    // Deliberately per-instance, not static — two transports on two DH+ segments
+    // are two separate findings, and a static flag would also leak between unit
+    // tests, which this suite already runs serially to avoid.
+    private int _routedLsapWarned;
+
     /// <summary>
     /// Initialises a new CSPv4 transport.
     /// </summary>
@@ -187,240 +159,32 @@ public class CSPTransport : ITransport
     /// <param name="connectTimeoutMs">Connection timeout (default 5000ms).</param>
     /// <param name="lsapControlByte">LSAP control byte sent on every request (default 0x00 — see field remarks).</param>
     public CSPTransport(string host, int port = DefaultPort, int connectTimeoutMs = 5000, byte lsapControlByte = 0x00)
+        : base(host, port, connectTimeoutMs)
     {
-        _host = host ?? throw new ArgumentNullException(nameof(host));
-        _port = port;
-        _connectTimeoutMs = connectTimeoutMs;
-        LsapControlByte = lsapControlByte;
+        _lsapControlByte = lsapControlByte;
     }
 
-    // ── ITransport.Open ───────────────────────────────────────────────────────
+    protected override int HeaderSize => CSPHeaderLen;
 
-    /// <inheritdoc/>
-    public void Open()
-    {
-        if (IsOpen) return;
+    // MaxPayloadLength is inherited: PCCC's own 248-byte content limit is far
+    // below what the encapsulation could carry. For reference, data_length is
+    // 16-bit and covers LSAP(4) + PCCC(inner - 2) = inner + 2, allowing
+    // inner ≤ 65533.
 
-        lock (_closeLock) { _isClosed = false; }
-
-        try
-        {
-            _tcp = new TcpClient();
-            _tcp.NoDelay = true;  // Disable Nagle algorithm
-
-            // Enable TCP Keep-Alive for passive dead-connection detection
-            // without sending application-level diagnostic frames.
-            _tcp.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
-
-            var connectTask = _tcp.ConnectAsync(_host, _port);
-            if (!connectTask.Wait(_connectTimeoutMs))
-            {
-                _tcp.Dispose();
-                _tcp = null;
-                throw new TimeoutException($"Connection to {_host}:{_port} timed out after {_connectTimeoutMs} ms.");
-            }
-            if (connectTask.IsFaulted)
-                throw connectTask.Exception!.InnerException ?? connectTask.Exception;
-
-            _stream = _tcp.GetStream();
-
-            // See EIPTransport for the rationale: without an explicit timeout,
-            // a half-open connection can block Write()/Read() forever, bypassing
-            // ResponseTimeoutMs entirely (that only bounds the reply-wait).
-            _stream.WriteTimeout = _connectTimeoutMs;
-            _stream.ReadTimeout  = _connectTimeoutMs;
-
-            // Create a fresh lifecycle token for this connection session.
-            // This allows Clean shutdown of idle reads and proper reconnection
-            // after Close() is called.
-            _lifecycleCts?.Dispose();
-            _lifecycleCts = new CancellationTokenSource();
-            _lifecycleToken = _lifecycleCts.Token;
-
-            // Registration must complete before the async receive loop starts.
-            RegisterSession();
-
-            _rxCts = new CancellationTokenSource();
-            _rxTask = Task.Run(() => ReceiveLoopAsync(_rxCts.Token));
-        }
-        catch (Exception ex)
-        {
-            Close();
-            throw new InvalidOperationException(
-                $"Failed to connect to {_host}:{_port} – {ex.Message}", ex);
-        }
-    }
-
-    // ── ITransport.Close ──────────────────────────────────────────────────────
-
-    /// <inheritdoc/>
-    public void Close()
-    {
-        lock (_closeLock)
-        {
-            if (_isClosed) return;
-            _isClosed = true;
-        }
-
-        // Cancel and dispose the lifecycle token to wake any idle reads.
-        if (_lifecycleCts != null)
-        {
-            try { _lifecycleCts.Cancel(); } catch { }
-            _lifecycleCts.Dispose();
-            _lifecycleCts = null;
-        }
-
-        _rxCts?.Cancel();
-
-        try
-        {
-            _stream?.Close();
-            _tcp?.Close();
-        }
-        catch { }
-
-        if (_rxTask != null && !_rxTask.IsCompleted && Task.CurrentId != _rxTask.Id)
-        {
-            _rxTask.Wait(1000);
-        }
-
-        _rxTask?.Dispose();
-        _rxTask = null;
-        _rxCts?.Dispose();
-        _rxCts        = null;
-        _stream       = null;
-        _tcp          = null;
-        _connId       = 0;
-    }
-
-    // ── ITransport.SendFrame ──────────────────────────────────────────────────
-
-    /// <inheritdoc/>
-    /// <remarks>
-    /// Wraps the inner PCCC frame in a CSPv4 PCCC-submode request: header +
-    /// local-form LSAP (carrying the inner frame's DST/SRC bytes) + the raw
-    /// PCCC bytes. Returns as soon as the bytes are written; it does not wait
-    /// for a response. The receive loop delivers the matching reply via
-    /// <see cref="FrameReceived"/>.
-    /// </remarks>
-    public void SendFrame(byte[] innerFrame)
-    {
-        if (!IsOpen)
-            throw new InvalidOperationException("Transport is not open.");
-
-        if (innerFrame == null || innerFrame.Length < 2)
-            throw new ArgumentException("Inner frame must include at least DST and SRC bytes.", nameof(innerFrame));
-
-        // Build the packet into a pooled buffer and write directly to the
-        // stream — no intermediate persistent array needed.
-        BuildAndSendPcccRequestPacket(innerFrame);
-    }
-
-    // ── Packet builder ────────────────────────────────────────────────────────
+    // ─── Session management ──────────────────────────────────────────────────
 
     /// <summary>
-    /// Builds a complete CSPv4 PCCC-submode request packet into a pooled
-    /// buffer, fires <see cref="RawFrameSent"/>, then writes the bytes
-    /// directly to the stream under <c>_sendLock</c>. The pooled buffer is
-    /// returned before this method exits, so no persistent array is allocated.
+    /// Performs a synchronous CSPv4 connection-register handshake (submode 0x01).
+    /// VERIFY: the payload shape for this submode isn't documented even in the
+    /// source dissector — assumed to be a bare 28-byte header with no LSAP/PCCC
+    /// body on either side.
     /// </summary>
-    /// <param name="innerFrame">
-    /// Inner PCCC frame produced by <see cref="PacketBuilder"/>:
-    /// [DST, SRC, CMD, STS, TNS_LO, TNS_HI, FNC?, DATA...].
-    /// </param>
-    private void BuildAndSendPcccRequestPacket(byte[] innerFrame)
-    {
-        byte dst = innerFrame[0];
-        byte src = innerFrame[1];
-
-        int pcccLen = innerFrame.Length - 2;
-        int totalAfterHeader = LsapLocalLen + pcccLen;
-        int totalLen = CSPHeaderLen + totalAfterHeader;
-
-        byte[] pkt = ArrayPool<byte>.Shared.Rent(totalLen);
-        try
-        {
-            // Clear only the bytes we will actually use.
-            Array.Clear(pkt, 0, totalLen);
-
-            // ── CSPv4 header ───────────────────────────────────────────────────
-            pkt[0] = MODE_REQUEST;
-            pkt[1] = SUBMODE_PCCC;
-            WriteUInt16BE(pkt, 2, (ushort)totalAfterHeader);
-            WriteUInt32BE(pkt, 4, _connId);
-            // status (8-11) = 0 (already zero)
-            // context (12-27) = 0 (already zero)
-
-            // ── LSAP, local form ───────────────────────────────────────────────
-            int lsapOffset = CSPHeaderLen;
-            pkt[lsapOffset + 0] = dst;
-            pkt[lsapOffset + 1] = LsapControlByte;
-            pkt[lsapOffset + 2] = src;
-            pkt[lsapOffset + 3] = 0x00;
-
-            // ── PCCC payload (CMD, STS, TNS, FNC?, DATA…) ─────────────────────
-            Array.Copy(innerFrame, 2, pkt, lsapOffset + LsapLocalLen, pcccLen);
-
-            // Fire diagnostic event only when subscribed — avoids allocating a
-            // trimmed copy of the rented buffer when nobody is listening.
-            if (RawFrameSent != null)
-            {
-                byte[] copy = new byte[totalLen];
-                Array.Copy(pkt, 0, copy, 0, totalLen);
-                RawFrameSent.Invoke(this, copy);
-            }
-
-            // Write directly into the stream while holding _sendLock.
-            // The pooled buffer must not outlive this lock scope.
-            lock (_sendLock)
-            {
-                _stream!.Write(pkt, 0, totalLen);
-            }
-        }
-        finally
-        {
-            ArrayPool<byte>.Shared.Return(pkt, clearArray: false);
-        }
-    }
-
-    // ── Inner frame extractor ─────────────────────────────────────────────────
-
-    /// <summary>
-    /// Extracts the inner PCCC frame from a received CSPv4 PCCC-submode
-    /// packet's post-header payload (LSAP + PCCC bytes).
-    /// </summary>
-    /// <param name="payload">Bytes after the 28-byte header (length = data_length).</param>
-    private static byte[] ExtractInnerFrame(byte[] payload)
-    {
-        if (payload.Length < LsapLocalLen + 4)
-            throw new InvalidDataException("Payload too short for LSAP + minimal PCCC header.");
-
-        byte lsapFlag = payload[3];
-        if (lsapFlag != 0x00)
-            throw new InvalidDataException(
-                "Routed-form LSAP (DH+/DH-485) is not implemented — only local form is supported.");
-
-        byte dst = payload[0];
-        byte src = payload[2];
-
-        int pcccLen = payload.Length - LsapLocalLen;
-        byte[] innerFrame = new byte[2 + pcccLen];
-        innerFrame[0] = dst;
-        innerFrame[1] = src;
-        Array.Copy(payload, LsapLocalLen, innerFrame, 2, pcccLen);
-
-        return innerFrame;
-    }
-
-    // ── Session management ────────────────────────────────────────────────────
-
-    /// <summary>
-    /// Performs a synchronous CSPv4 connection-register handshake (submode
-    /// 0x01). VERIFY: payload shape for this submode isn't documented even
-    /// in the source dissector — assumed to be a bare 28-byte header with no
-    /// LSAP/PCCC body on either side.
-    /// </summary>
-    private void RegisterSession()
+    /// <returns>
+    /// The connection ID assigned by the server. CSPv4 has no unregister
+    /// request — the pre-refactor transport sent nothing on close — so the
+    /// second element is false.
+    /// </returns>
+    protected override (uint sessionId, bool requiresUnregister) RegisterSession(NetworkStream stream)
     {
         byte[] req = new byte[CSPHeaderLen];
         req[0] = MODE_REQUEST;
@@ -435,266 +199,119 @@ public class CSPTransport : ITransport
         // unconfirmed (see RegisterContextPrefix) — do not treat as arbitrary.
         RegisterContextPrefix.CopyTo(req, 12);
 
-        lock (_sendLock)
+        stream.Write(req, 0, req.Length);
+
+        byte[] header = new byte[CSPHeaderLen];
+        ReadExactSync(stream, header);
+
+        byte mode = header[0];
+        byte submode = header[1];
+        ushort dataLen = ReadUInt16BE(header, 2);
+        uint conn = ReadUInt32BE(header, 4);
+        uint status = ReadUInt32BE(header, 8);
+
+        if (mode != MODE_RESPONSE || submode != SUBMODE_CONNECTION)
+            throw new InvalidDataException(
+                $"RegisterSession: unexpected mode/submode 0x{mode:X2}/0x{submode:X2}.");
+        if (status != CSP_STATUS_OK)
+            throw new InvalidDataException($"RegisterSession: non-zero status 0x{status:X8}.");
+        if (conn == 0)
+            throw new InvalidDataException("RegisterSession: server returned a zero connection ID.");
+
+        if (dataLen > 0)
         {
-            _stream!.Write(req, 0, req.Length);
-
-            byte[] header = new byte[CSPHeaderLen];
-            ReadExactSync(_stream, header);
-
-            byte mode    = header[0];
-            byte submode = header[1];
-            ushort dataLen = ReadUInt16BE(header, 2);
-            uint   conn    = ReadUInt32BE(header, 4);
-            uint   status  = ReadUInt32BE(header, 8);
-
-            if (mode != MODE_RESPONSE || submode != SUBMODE_CONNECTION)
-                throw new InvalidDataException(
-                    $"RegisterSession: unexpected mode/submode 0x{mode:X2}/0x{submode:X2}.");
-
-            if (status != CSP_STATUS_OK)
-                throw new InvalidDataException(
-                    $"RegisterSession: non-zero status 0x{status:X8}.");
-
-            if (dataLen > 0)
-            {
-                byte[] discard = new byte[dataLen];
-                ReadExactSync(_stream, discard);
-            }
-
-            _connId = conn;
+            byte[] discard = new byte[dataLen];
+            ReadExactSync(stream, discard);
         }
+
+        return (conn, false);
     }
 
-    // ── Background receive loop ───────────────────────────────────────────────
+    // ─── Packet builder ──────────────────────────────────────────────────────
 
     /// <summary>
-    /// Runs on a thread-pool task started by <see cref="Open"/>.
-    ///
-    /// Each iteration reads one complete CSP packet (header + payload) and,
-    /// for PCCC-submode packets, extracts the inner PCCC frame and raises
-    /// <see cref="FrameReceived"/>.
-    ///
-    /// The loop exits cleanly when the <paramref name="ct"/> is cancelled
-    /// (via <see cref="Close"/>) or when the TCP stream is closed by the
-    /// remote end. <see cref="CloseOnConnectionLost"/> is called on exit so
-    /// that resources are released even if the caller did not call
-    /// <see cref="Close"/> explicitly.
-    ///
-    /// A read timeout is applied only after the header is fully received,
-    /// preventing idle connections from being disconnected every 10 seconds.
-    /// Waiting for the first byte of a new packet is done using the
-    /// <see cref="_lifecycleToken"/>, which is cancelled during shutdown
-    /// to allow graceful termination without hanging.
+    /// Builds a complete CSPv4 PCCC-submode request packet:
+    /// header + local-form LSAP (carrying the inner frame's DST/SRC) + PCCC.
     /// </summary>
-    private async Task ReceiveLoopAsync(CancellationToken ct)
+    protected override byte[] BuildRequestPacket(byte[] innerFrame, uint sessionId)
     {
-        byte[] header  = new byte[CSPHeaderLen];
-        byte[] payload = new byte[65536];
+        byte dst = innerFrame[0];
+        byte src = innerFrame[1];
 
-        // Combined cancellation token for shutdown and per-read timeout.
-        using var timeoutCts = new CancellationTokenSource();
-        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
+        int pcccLen = innerFrame.Length - 2;
+        int totalAfterHeader = LsapLocalLen + pcccLen;
+        int totalLen = CSPHeaderLen + totalAfterHeader;
 
-        while (!ct.IsCancellationRequested && IsOpen && _stream != null)
-        {
-            try
-            {
-                // ── Read the fixed CSP header ──────────────────────────────────
-                // Allow indefinite wait for the first byte of a new packet.
-                // An idle connection should stay connected indefinitely, but
-                // must respect shutdown requests via the caller token.
-                if (await ReadExactAsync(header, 0, 1, idleFirstByte: true, ct) < 1)
-                    break; // connection closed gracefully
+        byte[] pkt = new byte[totalLen];   // zero-initialised by the runtime
 
-                timeoutCts.CancelAfter(TimeSpan.FromSeconds(10));
-                if (await ReadExactAsync(header, 1, CSPHeaderLen - 1, idleFirstByte: false, linkedCts.Token) < CSPHeaderLen - 1)
-                    break; // connection closed gracefully
-                timeoutCts.CancelAfter(Timeout.Infinite);
+        // ── CSPv4 header ─────────────────────────────────────────────────────
+        pkt[0] = MODE_REQUEST;
+        pkt[1] = SUBMODE_PCCC;
+        WriteUInt16BE(pkt, 2, (ushort)totalAfterHeader);
+        WriteUInt32BE(pkt, 4, sessionId);
+        // status (8-11) and context (12-27) remain zero.
 
-                byte   mode    = header[0];
-                byte   submode = header[1];
-                ushort dataLen = ReadUInt16BE(header, 2);
-                uint   conn    = ReadUInt32BE(header, 4);
-                uint   status  = ReadUInt32BE(header, 8);
+        // ── LSAP, local form ─────────────────────────────────────────────────
+        int lsapOffset = CSPHeaderLen;
+        pkt[lsapOffset + 0] = dst;
+        pkt[lsapOffset + 1] = _lsapControlByte;
+        pkt[lsapOffset + 2] = src;
+        pkt[lsapOffset + 3] = LSAP_FORM_LOCAL;
 
-                // ── Read the payload (if any) with a timeout ──────────────────
-                // Since the header was received, the rest of the message must
-                // arrive within a reasonable time to prevent slow-loris attacks.
-                if (dataLen > 0)
-                {
-                    if (dataLen > payload.Length)
-                    {
-                        // Oversized packet – drain and discard to stay in sync.
-                        byte[] discard = new byte[dataLen];
-                        timeoutCts.CancelAfter(TimeSpan.FromSeconds(10));
-                        int drained = await ReadExactAsync(discard, 0, dataLen, idleFirstByte: false, linkedCts.Token);
-                        timeoutCts.CancelAfter(Timeout.Infinite);
-                        if (drained < dataLen) break;
-                        continue;
-                    }
+        // ── PCCC payload (CMD, STS, TNS, FNC?, DATA…) ────────────────────────
+        Array.Copy(innerFrame, 2, pkt, lsapOffset + LsapLocalLen, pcccLen);
 
-                    timeoutCts.CancelAfter(TimeSpan.FromSeconds(10));
-                    int payloadGot = await ReadExactAsync(payload, 0, dataLen, idleFirstByte: false, linkedCts.Token);
-                    timeoutCts.CancelAfter(Timeout.Infinite);
-                    if (payloadGot < dataLen) break;
-                }
-
-                // ── Filter by connection ID and status ────────────────────────
-                if (conn != _connId) continue;
-                if (status != CSP_STATUS_OK) continue;
-                if (mode != MODE_RESPONSE) continue;
-
-                if (submode == SUBMODE_PCCC && dataLen >= LsapLocalLen)
-                {
-                    // Copy LSAP+PCCC payload out of the shared receive buffer
-                    // before any event is fired (events may run on other threads).
-                    byte[] framePayload = new byte[dataLen];
-                    Array.Copy(payload, 0, framePayload, 0, dataLen);
-
-                    // Allocate the combined diagnostic packet only when someone
-                    // is actually subscribed — avoids a CSPHeaderLen+dataLen
-                    // allocation on every received frame in normal operation.
-                    if (RawFrameReceived != null)
-                    {
-                        byte[] fullPacket = new byte[CSPHeaderLen + dataLen];
-                        Array.Copy(header,       0, fullPacket, 0,            CSPHeaderLen);
-                        Array.Copy(framePayload, 0, fullPacket, CSPHeaderLen, dataLen);
-                        RawFrameReceived.Invoke(this, fullPacket);
-                    }
-
-                    try
-                    {
-                        byte[] inner = ExtractInnerFrame(framePayload);
-                        FrameReceived?.Invoke(this, inner);
-                    }
-                    catch
-                    {
-                        // Malformed/unsupported (e.g. routed LSAP) frame;
-                        // discard. PCCCComm will time out the pending TNS.
-                    }
-                }
-                // Connection-submode frames after the initial handshake are
-                // not expected; silently discarded if they arrive.
-            }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested)
-            {
-                break;  // Close() cancelled the token
-            }
-            catch (OperationCanceledException) when (_lifecycleCts?.IsCancellationRequested == true)
-            {
-                // Shutdown requested while waiting for first byte.
-                Logger.Info(this, "Shutdown signal received during idle read – closing connection");
-                break;
-            }
-            catch (OperationCanceledException) // timeout during payload read
-            {
-                Logger.Warn(this, "CSP receive timed out while reading payload – closing connection");
-                break;
-            }
-            catch
-            {
-                break;  // TCP error or stream closed; exit and clean up
-            }
-        }
-
-        CloseOnConnectionLost();
+        return pkt;
     }
+
+    // ─── Inner frame extractor ───────────────────────────────────────────────
 
     /// <summary>
-    /// Called when the receive loop exits due to a lost connection.
+    /// Extracts the inner PCCC frame from a received CSPv4 PCCC-submode
+    /// packet's post-header payload (LSAP + PCCC bytes).
     /// </summary>
-    private void CloseOnConnectionLost()
+    protected override byte[]? ExtractInnerFrame(byte[] header, byte[] payload, ushort dataLen)
     {
-        Close();
-    }
+        if (dataLen < LsapLocalLen + MinPcccLen)
+            return null; // too short for LSAP plus a minimal PCCC header
 
-    // ── Big-endian helpers (CSPv4 header fields are big-endian, unlike EIP) ──
-
-    private static void WriteUInt16BE(byte[] buf, int offset, ushort value)
-    {
-        buf[offset]     = (byte)(value >> 8);
-        buf[offset + 1] = (byte)(value & 0xFF);
-    }
-
-    private static void WriteUInt32BE(byte[] buf, int offset, uint value)
-    {
-        buf[offset]     = (byte)(value >> 24);
-        buf[offset + 1] = (byte)(value >> 16);
-        buf[offset + 2] = (byte)(value >> 8);
-        buf[offset + 3] = (byte)(value & 0xFF);
-    }
-
-    private static ushort ReadUInt16BE(byte[] buf, int offset) =>
-        (ushort)((buf[offset] << 8) | buf[offset + 1]);
-
-    private static uint ReadUInt32BE(byte[] buf, int offset) =>
-        ((uint)buf[offset] << 24) | ((uint)buf[offset + 1] << 16) |
-        ((uint)buf[offset + 2] << 8) | buf[offset + 3];
-
-    // ── I/O helpers ───────────────────────────────────────────────────────────
-
-    /// <summary>
-    /// Reads exactly <paramref name="count"/> bytes into <paramref name="buffer"/>
-    /// starting at <paramref name="offset"/>.
-    ///
-    /// When <paramref name="idleFirstByte"/> is true, the first byte of the
-    /// read waits indefinitely using <see cref="_lifecycleToken"/>, which
-    /// is cancelled during shutdown to allow graceful termination. Once the
-    /// first byte arrives, the read is subject to the provided
-    /// <paramref name="transactionToken"/> timeout to prevent slow-loris attacks.
-    /// </summary>
-    private async Task<int> ReadExactAsync(byte[] buffer, int offset, int count,
-                                           bool idleFirstByte, CancellationToken transactionToken)
-    {
-        int total = 0;
-        while (total < count)
+        byte lsapFlag = payload[3];
+        if (lsapFlag != LSAP_FORM_LOCAL)
         {
-            int n;
-            if (total == 0 && idleFirstByte)
+            // Routed form (DH+/DH-485) is not implemented. Without this notice
+            // the symptom is an unexplained timeout, which is expensive to chase.
+            if (Interlocked.Exchange(ref _routedLsapWarned, 1) == 0)
             {
-                // Wait indefinitely for the first byte of a new packet.
-                // This keeps idle connections alive without periodic disconnects,
-                // but respects shutdown requests from the caller.
-                n = await _stream!.ReadAsync(buffer, offset, 1, transactionToken)
-                                  .ConfigureAwait(false);
+                Logger.Warn(this,
+                    $"CSP: routed-form LSAP (0x{lsapFlag:X2}) received and discarded — " +
+                    "only the local form is implemented. Further occurrences are not logged.");
             }
-            else
-            {
-                // Mid-message: use the provided token (which includes the timeout).
-                n = await _stream!.ReadAsync(buffer, offset + total, count - total, transactionToken)
-                                  .ConfigureAwait(false);
-            }
-            if (n == 0) break;
-            total += n;
+            return null;
         }
-        return total;
+
+        byte dst = payload[0];
+        byte src = payload[2];
+
+        int pcccLen = dataLen - LsapLocalLen;
+        byte[] innerFrame = new byte[2 + pcccLen];
+        innerFrame[0] = dst;
+        innerFrame[1] = src;
+        Array.Copy(payload, LsapLocalLen, innerFrame, 2, pcccLen);
+
+        return innerFrame;
     }
 
-    private static void ReadExactSync(NetworkStream stream, byte[] buffer)
-    {
-        int total = 0;
-        while (total < buffer.Length)
-        {
-            int n = stream.Read(buffer, total, buffer.Length - total);
-            if (n == 0) throw new IOException("Connection closed during RegisterSession.");
-            total += n;
-        }
-    }
+    // ─── Header field extraction ─────────────────────────────────────────────
 
-    // ── IDisposable ───────────────────────────────────────────────────────────
+    protected override bool IsRelevantPacket(byte[] header) =>
+        header[0] == MODE_RESPONSE && header[1] == SUBMODE_PCCC;
 
-    /// <inheritdoc/>
-    public void Dispose()
-    {
-        if (_disposed) return;
-        _disposed = true;
-        if (_lifecycleCts != null)
-        {
-            try { _lifecycleCts.Cancel(); } catch { }
-            _lifecycleCts.Dispose();
-            _lifecycleCts = null;
-        }
-        Close();
-    }
+    protected override uint GetSessionIdFromHeader(byte[] header) =>
+        ReadUInt32BE(header, 4);
+
+    protected override uint GetStatusFromHeader(byte[] header) =>
+        ReadUInt32BE(header, 8);
+
+    protected override ushort GetDataLengthFromHeader(byte[] header) =>
+        ReadUInt16BE(header, 2);
 }
