@@ -93,10 +93,23 @@ public class Gateway : IDisposable
     /// <summary>
     /// Raised when a PDU is forwarded from EIP to the PLC transport.
     /// </summary>
+    /// <remarks>
+    /// ORDERING — this fires AFTER SendFrame returns, so it never announces a
+    /// frame that failed to reach the wire. On a synchronous backend that means
+    /// it can follow its own reply: DF1 half-duplex raises FrameReceived from
+    /// inside SendFrame (see ITransport), so PduReplyForwarded for the same
+    /// transaction is already out by the time this one fires, and a log built on
+    /// the two shows the reply before the send for --mode df1master.
+    ///
+    /// Firing before the send would put them back in order at the cost of
+    /// announcing frames that were never sent. That is the worse trade: a
+    /// surprising order can be read around, a false positive cannot.
+    /// </remarks>
     public event EventHandler<(byte[] pdu, ushort tns)>? PduForwarded;
 
     /// <summary>
     /// Raised when a PDU is forwarded from the PLC transport to EIP.
+    /// See the ordering note on <see cref="PduForwarded"/>.
     /// </summary>
     public event EventHandler<(byte[] pdu, ushort tns)>? PduReplyForwarded;
 
@@ -106,6 +119,8 @@ public class Gateway : IDisposable
     /// <param name="plcTransport">
     /// Transport to the legacy PLC (DF1FullDuplexTransport, DF1HalfDuplexTransport,
     /// or CSPTransport). Must already be configured with appropriate settings.
+    /// Ownership stays with the caller: <see cref="Dispose"/> closes it through
+    /// <see cref="Stop"/> but does not dispose it, so the caller must.
     /// </param>
     /// <param name="eipPort">TCP port for the EIP server (default 44818).</param>
     public Gateway(ITransport plcTransport, int eipPort = 44818, System.Net.IPAddress? bindAddress = null)
@@ -208,13 +223,27 @@ public class Gateway : IDisposable
             _plcTransport.SendFrame(pdu);
             PduForwarded?.Invoke(this, (pdu, gwTns));
         }
+        catch (TimeoutException ex)
+        {
+            // The link was up and the exchange did not complete — the PLC stayed
+            // silent, or NAK'd every attempt. There is nothing to reconnect.
+            // Waking the supervisor here would send it to re-check a link that is
+            // fine, and would put an indistinguishable line in the log next to the
+            // ones that mean a genuine drop.
+            //
+            // The client sees no reply and times out, which is the correct outcome
+            // for a PLC that did not answer.
+            Logger.Warn(this, $"PLC did not complete gwTNS=0x{gwTns:X4}: {ex.Message}");
+            _pending.TryRemove(gwTns, out _);
+        }
         catch (Exception ex)
         {
+            // Anything else means the transport is not in a state to send at all —
+            // InvalidOperationException, per the ITransport contract. That is a
+            // link problem, so wake the supervisor to re-check and reconnect
+            // without waiting out its backoff.
             Logger.Warn(this, $"SendFrame to PLC failed: {ex.Message}");
             _pending.TryRemove(gwTns, out _);
-            // A send failure usually means the link just died; wake the
-            // supervisor so it re-checks and reconnects without waiting out the
-            // backoff.
             _linkWake.Set();
         }
     }
@@ -576,6 +605,12 @@ public class Gateway : IDisposable
         _disposed = true;
         Stop();
         _eipTransport.Dispose();
+
+        // _plcTransport is deliberately NOT disposed here: it was handed to this
+        // gateway, not created by it, and the caller may still want it. Program.cs
+        // disposes it after this returns. Stated because "Dispose disposes some of
+        // its collaborators but not others" is exactly the kind of asymmetry that
+        // gets tidied into a leak.
 
         // _linkWake is intentionally NOT disposed. It is touched by the supervisor
         // task (Reset/Wait) and by OnEipPduReceived (Set); Stop() only waits up to
