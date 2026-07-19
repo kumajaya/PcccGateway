@@ -34,6 +34,9 @@ internal sealed class RingBuffer
     /// <param name="capacity">Maximum number of bytes the buffer can hold. Default is 4096.</param>
     public RingBuffer(int capacity = 4096)
     {
+        if (capacity <= 0)
+            throw new ArgumentOutOfRangeException(nameof(capacity));
+
         _capacity = capacity;
         _buffer = new byte[capacity];
         _head = 0;
@@ -56,7 +59,13 @@ internal sealed class RingBuffer
     /// <param name="length">Number of bytes to copy.</param>
     public void AddRange(byte[] data, int offset, int length)
     {
-        if (length == 0) return;
+        if (data == null) throw new ArgumentNullException(nameof(data));
+        if (offset < 0)
+            throw new ArgumentOutOfRangeException(nameof(offset));
+        if (length < 0)
+            throw new ArgumentOutOfRangeException(nameof(length));
+        if (offset > data.Length - length)
+            throw new ArgumentOutOfRangeException(nameof(offset), "offset and length do not denote a valid range in data.");        if (length == 0) return;
         if (length > _capacity - _count)
             throw new InvalidOperationException("RingBuffer overflow");
         int written = 0;
@@ -81,7 +90,16 @@ internal sealed class RingBuffer
     /// <returns>Actual number of bytes copied (may be less than <paramref name="count"/> if buffer has fewer bytes).</returns>
     public int Peek(byte[] destination, int destOffset, int count)
     {
+        ArgumentNullException.ThrowIfNull(destination);
+        if (destOffset < 0)
+            throw new ArgumentOutOfRangeException(nameof(destOffset));
+        if (count < 0)
+            throw new ArgumentOutOfRangeException(nameof(count));
+
         int bytesToCopy = Math.Min(count, _count);
+        if (destOffset > destination.Length - bytesToCopy)
+            throw new ArgumentException("Destination buffer is too small.", nameof(destination));
+
         int tempHead = _head;
         int copied = 0;
         while (copied < bytesToCopy)
@@ -100,10 +118,16 @@ internal sealed class RingBuffer
     /// removing them from the buffer.
     /// </summary>
     /// <param name="count">Number of bytes to consume.</param>
+    /// <exception cref="ArgumentOutOfRangeException">Thrown when <paramref name="count"/> is negative.</exception>
     /// <exception cref="InvalidOperationException">Thrown when <paramref name="count"/> exceeds <see cref="Count"/>.</exception>
     public void Advance(int count)
     {
-        if (count > _count) throw new InvalidOperationException("Advance beyond count");
+        // A negative count is a caller mistake; a count beyond Count is a buffer
+        // state violation. Distinct causes, distinct exception types.
+        if (count < 0)
+            throw new ArgumentOutOfRangeException(nameof(count), "Count cannot be negative.");
+        if (count > _count)
+            throw new InvalidOperationException("Advance beyond count");
         _head = (_head + count) % _capacity;
         _count -= count;
         if (_count == 0) { _head = 0; _tail = 0; }
@@ -125,7 +149,7 @@ internal sealed class RingBuffer
     {
         get
         {
-            if (index >= _count) throw new IndexOutOfRangeException();
+            if (index < 0 || index >= _count) throw new IndexOutOfRangeException();
             return _buffer[(_head + index) % _capacity];
         }
     }
