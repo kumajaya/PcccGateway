@@ -21,6 +21,14 @@ namespace PcccGateway.Common;
 /// <summary>
 /// Ring buffer implementation for efficient byte stream processing.
 /// Used internally by DF1 transports to avoid List.RemoveAt overhead.
+///
+/// <para>
+/// NOT thread-safe: <c>_head</c>/<c>_tail</c>/<c>_count</c> are mutated without
+/// synchronization, so every access must be externally serialized. The DF1
+/// transports satisfy this by touching their instance only under <c>_rxLock</c>,
+/// on the receive path. Do not share one instance across the send and receive
+/// threads without a lock.
+/// </para>
 /// </summary>
 internal sealed class RingBuffer
 {
@@ -65,7 +73,8 @@ internal sealed class RingBuffer
         if (length < 0)
             throw new ArgumentOutOfRangeException(nameof(length));
         if (offset > data.Length - length)
-            throw new ArgumentOutOfRangeException(nameof(offset), "offset and length do not denote a valid range in data.");        if (length == 0) return;
+            throw new ArgumentOutOfRangeException(nameof(offset), "offset and length do not denote a valid range in data.");
+        if (length == 0) return;
         if (length > _capacity - _count)
             throw new InvalidOperationException("RingBuffer overflow");
         int written = 0;

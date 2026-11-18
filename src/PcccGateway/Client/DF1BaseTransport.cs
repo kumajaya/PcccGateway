@@ -83,6 +83,12 @@ public abstract class DF1BaseTransport : ITransport
     /// </summary>
     private bool _wireClosed = true;
 
+    /// <summary>
+    /// Set once by the first <see cref="Dispose"/> call to make disposal
+    /// idempotent. Guarded by _wireLock, alongside _wireClosed.
+    /// </summary>
+    private bool _disposed;
+
     // ─── Public-callback executor ────────────────────────────────────────────
     //
     // Events raised from the RECEIVE path go through here instead of being
@@ -515,8 +521,14 @@ public abstract class DF1BaseTransport : ITransport
     /// <inheritdoc/>
     public virtual void Dispose()
     {
+        // Idempotency guard: a second Dispose() would re-read _onCallbackThread.Value
+        // below, which throws ObjectDisposedException once the slot has been disposed
+        // at the end of the first call. Set under _wireLock so the flag and the wire
+        // gate close atomically and a concurrent second Dispose() cannot slip past.
         lock (_wireLock)
         {
+            if (_disposed) return;
+            _disposed = true;
             _wireClosed = true;
         }
         _port.Dispose();
@@ -529,14 +541,30 @@ public abstract class DF1BaseTransport : ITransport
         // it took its locks; calling it again is harmless and covers a derived
         // class that forgot.
         CompleteCallbacks();
+        bool pumpStopped = false;
         if (!_onCallbackThread.Value)
         {
             try
             {
-                if (!_callbackPump.Wait(CallbackDrainTimeoutMs))
+                pumpStopped = _callbackPump.Wait(CallbackDrainTimeoutMs);
+                if (!pumpStopped)
                     Logger.Warn(this, $"{GetType().Name}: callback executor did not drain within {CallbackDrainTimeoutMs} ms");
             }
-            catch (AggregateException) { /* pump faulted; nothing to do */ }
+            catch (AggregateException)
+            {
+                // Pump faulted — it has stopped running, so it will not touch
+                // _onCallbackThread again. Safe to dispose below.
+                pumpStopped = true;
+            }
+
+            // Dispose the slot only when the pump has actually stopped — it either
+            // drained (Wait returned true) or faulted. On a timeout the pump is
+            // still live and would hit ObjectDisposedException on its next
+            // _onCallbackThread.Value access, so in that case the slot is left to
+            // the finalizer — as it also is on the on-callback-thread path, where
+            // disposal is skipped entirely because the pump is still running.
+            if (pumpStopped)
+                _onCallbackThread.Dispose();
         }
     }
 }

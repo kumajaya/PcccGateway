@@ -73,7 +73,7 @@ public class DF1FullDuplexTransport : DF1BaseTransport
     // before the deferred Set() ran — and that stale signal would wake the NEW
     // transaction, which finds no flags set and fails with a spurious timeout.
     // With a per-attempt waiter, a late signal lands on an object nobody awaits.
-    private ManualResetEventSlim? _currentWaiter;   // guarded by _rxLock
+    private TaskCompletionSource<bool>? _currentWaiter;   // guarded by _rxLock
     private volatile bool _ackReceived;
     private volatile bool _nakReceived;
 
@@ -85,12 +85,15 @@ public class DF1FullDuplexTransport : DF1BaseTransport
     private volatile bool _closing;
 
     /// <summary>
-    /// Signals a waiter captured earlier by the receive thread, tolerating it
-    /// having been disposed by its owner in the meantime.
+    /// Signals a waiter captured earlier by the receive thread. Uses
+    /// TaskCompletionSource, so a signal that lands after the owner has already
+    /// retired the waiter is harmless: TrySetResult simply returns false on an
+    /// already-completed task. Nothing is disposed, so there is no Set-vs-Dispose
+    /// race to guard against — the reason this replaced ManualResetEventSlim.
     /// </summary>
-    private static void SignalWaiter(ManualResetEventSlim? waiter)
+    private static void SignalWaiter(TaskCompletionSource<bool>? waiter)
     {
-        try { waiter?.Set(); } catch (ObjectDisposedException) { }
+        waiter?.TrySetResult(true);
     }
 
     // --- ENQ signalling (SendEnqAndWaitForAck shares _currentWaiter) ---
@@ -161,7 +164,12 @@ public class DF1FullDuplexTransport : DF1BaseTransport
                     if (_closing)
                         throw new InvalidOperationException("Send aborted: transport is closing.");
 
-                    var waiter = new ManualResetEventSlim(false);
+                    // RunContinuationsAsynchronously is load-bearing: without it,
+                    // TrySetResult on the receive thread could run this waiter's
+                    // Wait continuation inline on the serial receive thread, the
+                    // exact thread inversion the deferred-signal design avoids.
+                    var waiter = new TaskCompletionSource<bool>(
+                        TaskCreationOptions.RunContinuationsAsynchronously);
                     try
                     {
                         // Publish the waiter with the flags it owns, so the receive
@@ -191,7 +199,9 @@ public class DF1FullDuplexTransport : DF1BaseTransport
 
                         // Wait for ACK or NAK — wakes immediately when the receive thread
                         // signals this waiter, or when Close() aborts a shutdown-in-progress.
-                        waiter.Wait(timeoutMs);
+                        // Return value is intentionally ignored: the code below reads the
+                        // _ackReceived/_nakReceived/_closing flags, exactly as before.
+                        waiter.Task.Wait(timeoutMs);
                     }
                     catch (ObjectDisposedException)
                     {
@@ -209,15 +219,15 @@ public class DF1FullDuplexTransport : DF1BaseTransport
                     }
                     finally
                     {
-                        // Retire the waiter before disposing it, so the receive thread
-                        // cannot pick it up again. One that was already captured is
-                        // signalled through SignalWaiter, which tolerates disposal.
+                        // Retire the waiter so the receive thread cannot pick it up
+                        // again. Nothing is disposed: TaskCompletionSource needs no
+                        // disposal, and a signal already captured by the receive
+                        // thread lands harmlessly via TrySetResult.
                         lock (_rxLock)
                         {
                             if (ReferenceEquals(_currentWaiter, waiter))
                                 _currentWaiter = null;
                         }
-                        waiter.Dispose();
                     }
 
                     // Shutdown requested while waiting: abandon the send instead of retrying or
@@ -279,7 +289,10 @@ public class DF1FullDuplexTransport : DF1BaseTransport
             if (_closing || !IsOpen)
                 return -3;
 
-            var waiter = new ManualResetEventSlim(false);
+            // RunContinuationsAsynchronously: see the note in SendFrame — keeps the
+            // Wait continuation off the serial receive thread.
+            var waiter = new TaskCompletionSource<bool>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
             try
             {
                 lock (_rxLock)
@@ -297,7 +310,7 @@ public class DF1FullDuplexTransport : DF1BaseTransport
                 SendControl(ENQ);
 
                 int timeoutMs = MaxTicks * 20;
-                waiter.Wait(timeoutMs);
+                waiter.Task.Wait(timeoutMs);
 
                 if (_closing)
                     return -3;
@@ -307,12 +320,13 @@ public class DF1FullDuplexTransport : DF1BaseTransport
             }
             finally
             {
+                // No disposal: TaskCompletionSource needs none, and retiring under
+                // _rxLock is enough to keep the receive thread from reusing it.
                 lock (_rxLock)
                 {
                     if (ReferenceEquals(_currentWaiter, waiter))
                         _currentWaiter = null;
                 }
-                waiter.Dispose();
             }
         }
     }
@@ -350,7 +364,7 @@ public class DF1FullDuplexTransport : DF1BaseTransport
         // The waiter is captured while parsing rather than re-read after the
         // flush: by then its transaction may already have completed and a
         // successor published its own waiter, which our signal must not touch.
-        ManualResetEventSlim? waiterToSignal = null;
+        TaskCompletionSource<bool>? waiterToSignal = null;
         // Raw-frame diagnostics are accumulated and raised after _rxLock is
         // released: a subscriber that re-enters SendFrame()/Close()/Open() from
         // OnRawFrameReceived would otherwise deadlock through _rxLock beneath
@@ -591,10 +605,9 @@ public class DF1FullDuplexTransport : DF1BaseTransport
                 _nakReceived = false;
                 _ackFlagForEnq = false;
                 _nakFlagForEnq = false;
-                _lastReplyWasNak = false;
-
                 lock (_rxLock)
                 {
+                    _lastReplyWasNak = false;
                     _currentWaiter = null;
                     _rxBuffer.Clear();
                     _frameStartTime = DateTime.MinValue;
