@@ -617,6 +617,9 @@ public abstract class TCPBaseTransport : ITransport
     private async Task ReceiveLoopAsync(CancellationToken ct, uint generation)
     {
         byte[] header = new byte[HeaderSize];
+        // Sized to ushort.MaxValue + 1 so no packet whose length is expressed by a
+        // 16-bit field can exceed it — the receive loop below relies on this and does
+        // not guard against an oversized read.
         byte[] payload = new byte[65536];
         bool connectionLost = true;
 
@@ -654,15 +657,6 @@ public abstract class TCPBaseTransport : ITransport
 
                 if (dataLen > 0)
                 {
-                    if (dataLen > payload.Length)
-                    {
-                        // Oversized packet – drain and discard to stay in sync.
-                        byte[] discard = new byte[dataLen];
-                        if (await ReadWithTimeoutAsync(stream, discard, 0, dataLen, ct).ConfigureAwait(false) < dataLen)
-                            break;
-                        continue;
-                    }
-
                     if (await ReadWithTimeoutAsync(stream, payload, 0, dataLen, ct).ConfigureAwait(false) < dataLen)
                         break;
                 }
