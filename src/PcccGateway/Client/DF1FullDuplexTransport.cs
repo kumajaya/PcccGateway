@@ -235,7 +235,12 @@ public class DF1FullDuplexTransport : DF1BaseTransport
                         throw new InvalidOperationException("Send aborted: transport is closing.");
 
                     if (_ackReceived)
+                    {
+                        // Let the NAK back-off decay again; otherwise a few noisy frames would
+                        // add up to 400 ms to every later frame until the port is reopened.
+                        if (SleepDelay > 0) SleepDelay = Math.Max(0, SleepDelay - 50);
                         return;                     // Success
+                    }
 
                     if (_nakReceived)
                     {
