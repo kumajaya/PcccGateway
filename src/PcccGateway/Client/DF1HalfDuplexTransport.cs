@@ -601,6 +601,11 @@ public class DF1HalfDuplexTransport : DF1BaseTransport
                 // Wait for either NAK or data frame using the event.
                 _stateEvent.Wait(PollResponseTimeoutMs);
 
+                // A reply that is still arriving when the poll window closes (long frame at a
+                // low baud rate) would otherwise be dropped and the slave polled again, which at
+                // 9600 baud and below can repeat until MaxPollAttempts is exhausted.
+                WaitForFrameInProgress();
+
                 // Disarm AND snapshot in one critical section, then decide on the
                 // snapshot rather than on the Wait() result. A response claimed by
                 // the receive thread after Wait() timed out but before this lock
@@ -656,6 +661,29 @@ public class DF1HalfDuplexTransport : DF1BaseTransport
                 _currentState = MasterState.Idle;
             }
             EndActiveOperation();
+        }
+    }
+
+    /// <summary>
+    /// While a data frame has started (DLE STX seen) but is not complete, keeps waiting until
+    /// it is received, a NAK arrives, or the frame timeout expires.
+    /// </summary>
+    private void WaitForFrameInProgress()
+    {
+        DateTime deadline = DateTime.UtcNow.AddMilliseconds(FrameTimeoutMs);
+        while (DateTime.UtcNow < deadline)
+        {
+            if (_responseDataReceived || _pollNakReceived || _closing || _disposing)
+                return;
+
+            bool inProgress;
+            lock (_rxLock)
+                inProgress = _frameStartTime != DateTime.MinValue;
+            if (!inProgress)
+                return;
+
+            if (_shutdownEvent.Wait(10))
+                return;
         }
     }
 
