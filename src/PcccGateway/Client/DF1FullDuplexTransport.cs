@@ -58,7 +58,6 @@ public class DF1FullDuplexTransport : DF1BaseTransport
     private readonly object _lifecycleLock = new object();
     private readonly RingBuffer _rxBuffer;
     private DateTime _frameStartTime = DateTime.MinValue;
-    private const int FrameTimeoutMs = 500;      // Max time between DLE STX and DLE ETX
     private const int MaxBufferBytes = 4096;     // Safety limit
 
     // --- ACK/NAK signalling ---

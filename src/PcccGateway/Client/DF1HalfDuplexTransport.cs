@@ -186,7 +186,6 @@ public class DF1HalfDuplexTransport : DF1BaseTransport
     private readonly object _rxLock = new object();
     private readonly RingBuffer _rxBuffer;
     private DateTime _frameStartTime = DateTime.MinValue;
-    private const int FrameTimeoutMs = 500;
     private const int MaxBufferBytes = 4096;
 
     // Echo suppression. Both fields move together under _echoLock: the send path

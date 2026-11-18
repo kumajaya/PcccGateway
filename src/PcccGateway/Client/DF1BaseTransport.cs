@@ -170,6 +170,25 @@ public abstract class DF1BaseTransport : ITransport
         set => _maxTicks = value > 0 ? value : 100;
     }
 
+    /// <summary>Worst-case wire length of one DF1 frame: about 260 bytes, doubled by DLE stuffing.</summary>
+    private const int MaxFrameWireBytes = 530;
+
+    /// <summary>
+    /// Maximum time between DLE STX and the end of a frame before the partial frame is discarded.
+    /// At least 500 ms, and long enough for a worst-case frame at the port's baud rate
+    /// (a full frame takes about 1.1 s at 4800 baud and 2.2 s at 2400 baud).
+    /// </summary>
+    protected int FrameTimeoutMs
+    {
+        get
+        {
+            int baud = _port.BaudRate > 0 ? _port.BaudRate : 9600;
+            int bitsPerByte = 1 + 8 + (_port.Parity == System.IO.Ports.Parity.None ? 0 : 1) + 1;
+            int transmitMs = (MaxFrameWireBytes * bitsPerByte * 1000 + baud - 1) / baud;
+            return Math.Max(500, transmitMs + 100);
+        }
+    }
+
     /// <summary>
     /// Initialises the base DF1 transport with a custom <see cref="ISerialPort"/>.
     /// </summary>
